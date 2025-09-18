@@ -48,16 +48,18 @@ for key, value in env_vars.items():
     logger.info(f"Environment: {key} = {value}")
 
 # Database setup
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./seo_agent.db")
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# Railway's private networking often uses DATABASE_PRIVATE_URL
+DATABASE_URL = os.getenv("DATABASE_PRIVATE_URL") or os.getenv("DATABASE_URL")
+
+if DATABASE_URL:
+    # Ensure the URL format is correct for SQLAlchemy
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
     db_logger.info("Using PostgreSQL database")
 else:
-    db_logger.info("Using SQLite database")
-
-engine = create_engine(DATABASE_URL, echo=False)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+    # Fallback to SQLite for local development if no URL is found
+    DATABASE_URL = "sqlite:///./seo_agent.db"
+    db_logger.warning("DATABASE_URL not found, falling back to SQLite. This is not suitable for production.")
 
 # Enums
 class ContentType(str, enum.Enum):
