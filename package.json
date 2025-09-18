@@ -4,7 +4,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "cd backend && pip install -r requirements.txt && python main.py", // <--- THIS IS THE PROBLEM
+    "start": "cd backend && pip install -r requirements.txt && python main.py", 
     "lint": "next lint"
   }
 }
