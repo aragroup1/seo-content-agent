@@ -283,6 +283,12 @@ const testConnection = async () => {
                 label="Scan All"
                 gradient="from-blue-500 to-cyan-500"
               />
+              <ActionButton
+  onClick={testConnection}
+  icon={<Activity className="w-4 h-4" />}
+  label="Test Connection"
+  gradient="from-yellow-500 to-orange-500"
+/>
               
               <ActionButton
                 onClick={togglePause}
