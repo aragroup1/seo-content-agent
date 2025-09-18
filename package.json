@@ -1,0 +1,11 @@
+{
+  "name": "seo-content-agent",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "cd frontend && npm install && npm run build",
+    "start": "cd backend && pip install -r requirements.txt && python main.py",
+    "install-backend": "cd backend && pip install -r requirements.txt",
+    "install-frontend": "cd frontend && npm install",
+    "dev": "echo 'Run backend and frontend separately'"
+  }
+}
