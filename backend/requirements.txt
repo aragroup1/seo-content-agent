@@ -3,3 +3,5 @@ uvicorn
 python-dotenv
 pydantic
 openai
+ShopifyAPI
+psycopg2-binary
