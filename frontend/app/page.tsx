@@ -1,179 +1,117 @@
-'use client';
+"use client";
 
 import { useState, useEffect } from 'react';
 import axios from 'axios';
-import { RefreshCw, Package, Clock, CheckCircle, PlayCircle, Search } from 'lucide-react';
+import { Scan, Pause, Play, Loader, Server, CheckCircle, Clock } from 'lucide-react';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+interface SystemStatus {
+  is_paused: boolean;
+  total_products: number;
+  processed_products: number;
+  pending_products: number;
+}
 
-export default function Dashboard() {
-  const [stats, setStats] = useState({
-    total_products: 0,
-    completed: 0,
-    pending: 0,
-    in_queue: 0,
-    new_today: 0,
-    processed_today: 0,
-    completion_rate: 0
-  });
-  
-  const [products, setProducts] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [processing, setProcessing] = useState(false);
+export default function Home() {
+  const [status, setStatus] = useState<SystemStatus | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [message, setMessage] = useState('');
+  const [isScanning, setIsScanning] = useState(false);
+
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+
+  const fetchStatus = async () => {
+    try {
+      setIsLoading(true);
+      const { data } = await axios.get(`${apiUrl}/status`);
+      setStatus(data);
+    } catch (error) {
+      setMessage('Error fetching status. Is the backend running?');
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   useEffect(() => {
-    fetchStats();
-    fetchProducts();
-    const interval = setInterval(() => {
-      fetchStats();
-    }, 30000);
+    fetchStatus();
+    const interval = setInterval(fetchStatus, 5000); // Refresh status every 5 seconds
     return () => clearInterval(interval);
   }, []);
 
-  const fetchStats = async () => {
+  const handleScan = async () => {
+    setIsScanning(true);
+    setMessage('Scanning for new products...');
     try {
-      const response = await axios.get(`${API_URL}/api/stats`);
-      setStats(response.data);
-    } catch (error) {
-      console.error('Error:', error);
+      const { data } = await axios.post(`${apiUrl}/scan-products`);
+      setMessage(data.message);
+      await fetchStatus(); // Immediately refresh status after scan
+    } catch (error: any) {
+      setMessage(error.response?.data?.detail || 'An error occurred during scan.');
+    } finally {
+      setIsScanning(false);
     }
   };
-
-  const fetchProducts = async () => {
+  
+  // You would call this endpoint once after deploying to create the table.
+  const handleDbSetup = async () => {
+    setMessage('Setting up database table...');
     try {
-      const response = await axios.get(`${API_URL}/api/products?limit=10`);
-      setProducts(response.data.products);
-      setLoading(false);
-    } catch (error) {
-      console.error('Error:', error);
-      setLoading(false);
-    }
-  };
-
-  const triggerScan = async () => {
-    setProcessing(true);
-    try {
-      await axios.post(`${API_URL}/api/scan`);
-      setTimeout(() => {
-        fetchStats();
-        fetchProducts();
-        setProcessing(false);
-      }, 2000);
-    } catch (error) {
-      setProcessing(false);
-    }
-  };
-
-  const processQueue = async () => {
-    setProcessing(true);
-    try {
-      await axios.post(`${API_URL}/api/process-queue`);
-      setTimeout(() => {
-        fetchStats();
-        setProcessing(false);
-      }, 2000);
-    } catch (error) {
-      setProcessing(false);
+      const { data } = await axios.post(`${apiUrl}/setup-database`);
+      setMessage(data.message);
+    } catch (error: any) {
+      setMessage(error.response?.data?.detail || 'DB setup failed.');
     }
   };
 
   return (
-    <div className="p-6 max-w-7xl mx-auto">
-      <div className="mb-8">
-        <h1 className="text-3xl font-bold text-gray-900">SEO Content Agent</h1>
-        <p className="text-gray-600 mt-2">AI-powered content generation</p>
-      </div>
+    <main className="flex min-h-screen bg-gray-900 text-white p-4 sm:p-8 justify-center items-start">
+      <div className="w-full max-w-4xl mx-auto space-y-8">
+        <div className="text-center">
+          <h1 className="text-4xl font-bold text-cyan-400">AI SEO Agent Dashboard</h1>
+          <p className="text-gray-400 mt-2">Live monitoring and control for your automated Shopify SEO.</p>
+        </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-        <div className="bg-white rounded-lg shadow p-6">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm text-gray-600">Total Products</p>
-              <p className="text-2xl font-semibold mt-1">{stats.total_products}</p>
-            </div>
-            <Package className="w-5 h-5 text-blue-600" />
-          </div>
+        {/* Status Cards */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          <StatusCard icon={<Server />} title="Total Products" value={status?.total_products ?? 0} isLoading={isLoading} />
+          <StatusCard icon={<CheckCircle />} title="Processed" value={status?.processed_products ?? 0} isLoading={isLoading} />
+          <StatusCard icon={<Clock />} title="Pending" value={status?.pending_products ?? 0} isLoading={isLoading} />
         </div>
-        
-        <div className="bg-white rounded-lg shadow p-6">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm text-gray-600">Completed</p>
-              <p className="text-2xl font-semibold mt-1">{stats.completed}</p>
-            </div>
-            <CheckCircle className="w-5 h-5 text-green-600" />
-          </div>
-        </div>
-        
-        <div className="bg-white rounded-lg shadow p-6">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm text-gray-600">In Queue</p>
-              <p className="text-2xl font-semibold mt-1">{stats.in_queue}</p>
-            </div>
-            <Clock className="w-5 h-5 text-yellow-600" />
-          </div>
-        </div>
-        
-        <div className="bg-white rounded-lg shadow p-6">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm text-gray-600">Completion</p>
-              <p className="text-2xl font-semibold mt-1">{stats.completion_rate}%</p>
-            </div>
-            <RefreshCw className="w-5 h-5 text-purple-600" />
-          </div>
-        </div>
-      </div>
 
-      <div className="flex gap-4 mb-8">
-        <button
-          onClick={triggerScan}
-          disabled={processing}
-          className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
-        >
-          <Search className="w-4 h-4" />
-          Scan Products
-        </button>
+        {/* Controls */}
+        <div className="bg-gray-800 p-6 rounded-lg shadow-lg flex flex-col md:flex-row gap-4 items-center justify-between">
+          <h2 className="text-2xl font-bold">System Controls</h2>
+          <div className="flex gap-4">
+            <button onClick={handleScan} disabled={isScanning} className="flex items-center gap-2 bg-cyan-600 hover:bg-cyan-700 disabled:bg-gray-500 text-white font-bold py-2 px-4 rounded-md transition duration-300">
+              {isScanning ? <Loader className="animate-spin" /> : <Scan />}
+              {isScanning ? 'Scanning...' : 'Scan for New Products'}
+            </button>
+            <button disabled className="flex items-center gap-2 bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-500 text-white font-bold py-2 px-4 rounded-md transition duration-300">
+              <Pause /> Pause System
+            </button>
+            {/* One-time setup button for convenience */}
+             <button onClick={handleDbSetup} className="bg-indigo-600 text-white p-2 rounded">DB Setup</button>
+          </div>
+        </div>
         
-        <button
-          onClick={processQueue}
-          disabled={processing}
-          className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50"
-        >
-          <PlayCircle className="w-4 h-4" />
-          Process Queue
-        </button>
+        {/* Log/Message Area */}
+        {message && (
+          <div className="bg-gray-800 p-4 rounded-lg shadow-lg">
+            <h3 className="font-bold text-gray-300">Last Message:</h3>
+            <p className="font-mono text-cyan-300 mt-2">{message}</p>
+          </div>
+        )}
       </div>
-
-      <div className="bg-white rounded-lg shadow">
-        <div className="px-6 py-4 border-b">
-          <h2 className="text-lg font-semibold">Recent Products</h2>
-        </div>
-        <div className="divide-y">
-          {loading ? (
-            <div className="p-6 text-center text-gray-500">Loading...</div>
-          ) : products.length === 0 ? (
-            <div className="p-6 text-center text-gray-500">No products found</div>
-          ) : (
-            products.map((product: any) => (
-              <div key={product.id} className="p-4">
-                <h3 className="font-medium">{product.title}</h3>
-                <p className="text-sm text-gray-500 mt-1">
-                  {product.product_type} • {product.vendor}
-                </p>
-                <span className={`inline-block px-2 py-1 text-xs rounded-full mt-2 ${
-                  product.status === 'completed' ? 'bg-green-100 text-green-800' :
-                  product.status === 'processing' ? 'bg-blue-100 text-blue-800' :
-                  'bg-yellow-100 text-yellow-800'
-                }`}>
-                  {product.status}
-                </span>
-              </div>
-            ))
-          )}
-        </div>
-      </div>
-    </div>
+    </main>
   );
 }
+
+// A reusable card component
+const StatusCard = ({ icon, title, value, isLoading }: { icon: React.ReactNode, title: string, value: number, isLoading: boolean }) => (
+  <div className="bg-gray-800 p-6 rounded-lg shadow-lg flex items-center gap-4">
+    <div className="text-cyan-400">{icon}</div>
+    <div>
+      <p className="text-gray-400">{title}</p>
+      {isLoading ? <div className="h-8 w-16 bg-gray-700 rounded animate-pulse"></div> : <p className="text-3xl font-bold">{value.toLocaleString()}</p>}
+    </div>
+  </div>
+);
