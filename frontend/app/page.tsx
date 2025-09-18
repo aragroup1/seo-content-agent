@@ -2,116 +2,132 @@
 
 import { useState, useEffect } from 'react';
 import axios from 'axios';
-import { Scan, Pause, Play, Loader, Server, CheckCircle, Clock } from 'lucide-react';
+import { Package, Folder, CheckCircle, Clock, Play, Plus, Loader2, Terminal } from 'lucide-react';
+import { Button } from "~/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "~/components/ui/card";
+import { Progress } from "~/components/ui/progress";
+import { Command, CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "~/components/ui/command";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "~/components/ui/dialog";
+import { Input } from '~/components/ui/input';
+import { Label } from '~/components/ui/label';
 
 interface SystemStatus {
-  is_paused: boolean;
-  total_products: number;
-  processed_products: number;
-  pending_products: number;
+  total_products: number; processed_products: number;
+  total_collections: number; processed_collections: number;
+  log_messages: string[];
 }
+interface ShopifyItem { id: number; title: string; }
 
 export default function Home() {
   const [status, setStatus] = useState<SystemStatus | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
   const [message, setMessage] = useState('');
   const [isScanning, setIsScanning] = useState(false);
+  const [openCommand, setOpenCommand] = useState(false);
+  const [products, setProducts] = useState<ShopifyItem[]>([]); // We will need a way to fetch these
+  const [collections, setCollections] = useState<ShopifyItem[]>([]); // Same here
 
   const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
   const fetchStatus = async () => {
     try {
-      setIsLoading(true);
       const { data } = await axios.get(`${apiUrl}/status`);
       setStatus(data);
-    } catch (error) {
-      setMessage('Error fetching status. Is the backend running?');
-    } finally {
-      setIsLoading(false);
-    }
+    } catch (error) { console.error('Error fetching status:', error); }
   };
 
   useEffect(() => {
     fetchStatus();
-    const interval = setInterval(fetchStatus, 5000); // Refresh status every 5 seconds
+    const interval = setInterval(fetchStatus, 3000); // Faster refresh
+    // In a real app, you would fetch products/collections here to populate the manual add dialog
     return () => clearInterval(interval);
   }, []);
 
   const handleScan = async () => {
-    setIsScanning(true);
-    setMessage('Scanning for new products...');
+    setIsScanning(true); setMessage('Scanning all products and collections...');
     try {
-      const { data } = await axios.post(`${apiUrl}/scan-products`);
+      const { data } = await axios.post(`${apiUrl}/scan-all`);
       setMessage(data.message);
-      await fetchStatus(); // Immediately refresh status after scan
-    } catch (error: any) {
-      setMessage(error.response?.data?.detail || 'An error occurred during scan.');
-    } finally {
-      setIsScanning(false);
-    }
+      await fetchStatus();
+    } catch (error: any) { setMessage(error.response?.data?.detail || 'Scan failed.'); }
+    finally { setIsScanning(false); }
   };
   
-  // You would call this endpoint once after deploying to create the table.
-  const handleDbSetup = async () => {
-    setMessage('Setting up database table...');
+  const handleRequeue = async (item: ShopifyItem, type: 'product' | 'collection') => {
+    setMessage(`Re-queuing ${type}: ${item.title}...`);
     try {
-      const { data } = await axios.post(`${apiUrl}/setup-database`);
-      setMessage(data.message);
-    } catch (error: any) {
-      setMessage(error.response?.data?.detail || 'DB setup failed.');
-    }
-  };
+        const { data } = await axios.post(`${apiUrl}/requeue-manual`, {
+            item_id: item.id, item_type: type, title: item.title
+        });
+        setMessage(data.message);
+    } catch (error: any) { setMessage(error.response?.data?.detail || 'Re-queue failed.');}
+    setOpenCommand(false);
+  }
+
+  const productProgress = status ? (status.total_products > 0 ? (status.processed_products / status.total_products) * 100 : 0) : 0;
+  const collectionProgress = status ? (status.total_collections > 0 ? (status.processed_collections / status.total_collections) * 100 : 0) : 0;
 
   return (
-    <main className="flex min-h-screen bg-gray-900 text-white p-4 sm:p-8 justify-center items-start">
-      <div className="w-full max-w-4xl mx-auto space-y-8">
-        <div className="text-center">
-          <h1 className="text-4xl font-bold text-cyan-400">AI SEO Agent Dashboard</h1>
-          <p className="text-gray-400 mt-2">Live monitoring and control for your automated Shopify SEO.</p>
-        </div>
-
-        {/* Status Cards */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          <StatusCard icon={<Server />} title="Total Products" value={status?.total_products ?? 0} isLoading={isLoading} />
-          <StatusCard icon={<CheckCircle />} title="Processed" value={status?.processed_products ?? 0} isLoading={isLoading} />
-          <StatusCard icon={<Clock />} title="Pending" value={status?.pending_products ?? 0} isLoading={isLoading} />
-        </div>
-
-        {/* Controls */}
-        <div className="bg-gray-800 p-6 rounded-lg shadow-lg flex flex-col md:flex-row gap-4 items-center justify-between">
-          <h2 className="text-2xl font-bold">System Controls</h2>
-          <div className="flex gap-4">
-            <button onClick={handleScan} disabled={isScanning} className="flex items-center gap-2 bg-cyan-600 hover:bg-cyan-700 disabled:bg-gray-500 text-white font-bold py-2 px-4 rounded-md transition duration-300">
-              {isScanning ? <Loader className="animate-spin" /> : <Scan />}
-              {isScanning ? 'Scanning...' : 'Scan for New Products'}
-            </button>
-            <button disabled className="flex items-center gap-2 bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-500 text-white font-bold py-2 px-4 rounded-md transition duration-300">
-              <Pause /> Pause System
-            </button>
-            {/* One-time setup button for convenience */}
-             <button onClick={handleDbSetup} className="bg-indigo-600 text-white p-2 rounded">DB Setup</button>
+    <div className="min-h-screen bg-slate-950 text-slate-50 p-4 sm:p-8">
+      <div className="max-w-7xl mx-auto space-y-8">
+        <header className="flex justify-between items-center">
+          <div>
+            <h1 className="text-3xl font-bold tracking-tight">AI SEO Agent</h1>
+            <p className="text-slate-400">Automated Content for Shopify Products & Collections</p>
           </div>
-        </div>
-        
-        {/* Log/Message Area */}
-        {message && (
-          <div className="bg-gray-800 p-4 rounded-lg shadow-lg">
-            <h3 className="font-bold text-gray-300">Last Message:</h3>
-            <p className="font-mono text-cyan-300 mt-2">{message}</p>
+          <div className="flex gap-2">
+            <Button variant="outline" onClick={() => setOpenCommand(true)}><Plus className="mr-2 h-4 w-4" /> Manual Re-queue</Button>
+            <Button onClick={handleScan} disabled={isScanning}>
+              {isScanning ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Play className="mr-2 h-4 w-4" />}
+              {isScanning ? 'Scanning...' : 'Scan All'}
+            </Button>
           </div>
-        )}
+        </header>
+
+        <main className="grid gap-8 md:grid-cols-2 lg:grid-cols-3">
+          <Card className="lg:col-span-1">
+            <CardHeader><CardTitle>Processing Status</CardTitle></CardHeader>
+            <CardContent className="space-y-4">
+              <div>
+                <div className="flex justify-between mb-1">
+                  <span className="text-sm font-medium text-slate-300">Products</span>
+                  <span className="text-sm text-slate-400">{status?.processed_products || 0} / {status?.total_products || 0}</span>
+                </div>
+                <Progress value={productProgress} />
+              </div>
+              <div>
+                <div className="flex justify-between mb-1">
+                  <span className="text-sm font-medium text-slate-300">Collections</span>
+                  <span className="text-sm text-slate-400">{status?.processed_collections || 0} / {status?.total_collections || 0}</span>
+                </div>
+                <Progress value={collectionProgress} />
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="lg:col-span-2">
+            <CardHeader><CardTitle>Live Log</CardTitle></CardHeader>
+            <CardContent>
+              <div className="bg-slate-900 rounded-md p-4 h-40 overflow-y-auto font-mono text-sm">
+                {status?.log_messages?.map((log, i) => <p key={i} className="whitespace-pre-wrap">&raquo; {log}</p>)}
+              </div>
+            </CardContent>
+          </Card>
+        </main>
       </div>
-    </main>
+
+      <CommandDialog open={openCommand} onOpenChange={setOpenCommand}>
+        <CommandInput placeholder="Search for a product or collection to re-queue..." />
+        <CommandList>
+          <CommandEmpty>No results found. (Feature requires product/collection fetching)</CommandEmpty>
+          <CommandGroup heading="Products">
+            {/* In a real app, 'products' state would be populated from a Shopify fetch */}
+            <CommandItem onSelect={() => handleRequeue({id: 123, title: "Example Product"}, 'product')}>Example Product</CommandItem>
+          </CommandGroup>
+          <CommandGroup heading="Collections">
+            <CommandItem onSelect={() => handleRequeue({id: 456, title: "Example Collection"}, 'collection')}>Example Collection</CommandItem>
+          </CommandGroup>
+        </CommandList>
+      </CommandDialog>
+    </div>
   );
 }
-
-// A reusable card component
-const StatusCard = ({ icon, title, value, isLoading }: { icon: React.ReactNode, title: string, value: number, isLoading: boolean }) => (
-  <div className="bg-gray-800 p-6 rounded-lg shadow-lg flex items-center gap-4">
-    <div className="text-cyan-400">{icon}</div>
-    <div>
-      <p className="text-gray-400">{title}</p>
-      {isLoading ? <div className="h-8 w-16 bg-gray-700 rounded animate-pulse"></div> : <p className="text-3xl font-bold">{value.toLocaleString()}</p>}
-    </div>
-  </div>
-);
