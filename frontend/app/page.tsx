@@ -6,8 +6,33 @@ import { Zap, Search, PlayCircle, PauseCircle, Plus, RefreshCw, Layers, Package,
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
+// Define types for our data to help TypeScript
+interface SystemState {
+    is_paused?: boolean;
+    last_scan?: string;
+}
+
+interface Stats {
+    products?: { total?: number; completed?: number; pending?: number };
+    collections?: { total?: number; completed?: number; pending?: number };
+    total_completed?: number;
+}
+
+interface ActivityItemData {
+    id: string;
+    type: 'product' | 'collection';
+    title: string;
+    status: string;
+}
+
+interface DashboardData {
+    system: SystemState;
+    stats: Stats;
+    recent_activity: ActivityItemData[];
+}
+
 export default function Dashboard() {
-    const [dashboard, setDashboard] = useState({ system: { is_paused: false }, stats: { products: {}, collections: {} }, recent_activity: [] });
+    const [dashboard, setDashboard] = useState<DashboardData>({ system: {}, stats: { products: {}, collections: {} }, recent_activity: [] });
     const [processing, setProcessing] = useState(false);
 
     const fetchDashboard = async () => {
@@ -21,11 +46,11 @@ export default function Dashboard() {
 
     useEffect(() => {
         fetchDashboard();
-        const interval = setInterval(fetchDashboard, 10000); // Refresh every 10 seconds
+        const interval = setInterval(fetchDashboard, 10000);
         return () => clearInterval(interval);
     }, []);
 
-    const handleApiCall = async (apiCall) => {
+    const handleApiCall = async (apiCall: () => Promise<any>) => {
         if (processing) return;
         setProcessing(true);
         try {
@@ -37,7 +62,7 @@ export default function Dashboard() {
         setTimeout(() => {
             fetchDashboard();
             setProcessing(false);
-        }, 3000); // Give backend time to process before refreshing
+        }, 3000);
     };
 
     const scanAll = () => handleApiCall(() => axios.post(`${API_URL}/api/scan`));
@@ -76,9 +101,13 @@ export default function Dashboard() {
                 <div className="bg-white rounded-lg shadow-md">
                    <h2 className="text-lg font-semibold p-4 border-b">Recent Activity</h2>
                    <div className="divide-y">
-                       {dashboard.recent_activity.map((item) => (
-                           <ActivityItem key={`${item.type}-${item.id}`} item={item} />
-                       ))}
+                       {dashboard.recent_activity.length > 0 ? (
+                           dashboard.recent_activity.map((item) => (
+                               <ActivityItem key={`${item.type}-${item.id}`} item={item} />
+                           ))
+                       ) : (
+                           <p className="p-4 text-center text-gray-500">No recent activity. Click "Scan Shopify" to begin.</p>
+                       )}
                    </div>
                 </div>
             </main>
@@ -87,20 +116,8 @@ export default function Dashboard() {
 }
 
 // --- Self-Contained Components ---
-const ActionButton = ({ onClick, disabled, icon, label, color }) => {
-    const colors = {
-        blue: 'bg-blue-600 hover:bg-blue-700',
-        green: 'bg-green-600 hover:bg-green-700',
-        red: 'bg-red-600 hover:bg-red-700',
-    };
-    return (
-        <button onClick={onClick} disabled={disabled} className={`px-5 py-2 ${colors[color]} text-white rounded-lg font-semibold shadow transition-all disabled:opacity-50 flex items-center space-x-2`}>
-            {icon} <span>{label}</span>
-        </button>
-    );
-};
-
-const StatCard = ({ title, stats, value, icon }) => {
+// FIXED: Made `stats` and `value` optional to fix the TypeScript error
+const StatCard = ({ title, stats, value, icon }: { title: string, stats?: any, value?: any, icon: React.ReactNode }) => {
     const total = stats?.total ?? value ?? 0;
     const completed = stats?.completed ?? 0;
     const pending = stats?.pending ?? 0;
@@ -122,7 +139,20 @@ const StatCard = ({ title, stats, value, icon }) => {
     );
 };
 
-const ActivityItem = ({ item }) => (
+const ActionButton = ({ onClick, disabled, icon, label, color }: { onClick: () => void, disabled: boolean, icon: React.ReactNode, label: string, color: string }) => {
+    const colors: { [key: string]: string } = {
+        blue: 'bg-blue-600 hover:bg-blue-700',
+        green: 'bg-green-600 hover:bg-green-700',
+        red: 'bg-red-600 hover:bg-red-700',
+    };
+    return (
+        <button onClick={onClick} disabled={disabled} className={`px-5 py-2 ${colors[color]} text-white rounded-lg font-semibold shadow transition-all disabled:opacity-50 flex items-center space-x-2`}>
+            {icon} <span>{label}</span>
+        </button>
+    );
+};
+
+const ActivityItem = ({ item }: { item: ActivityItemData }) => (
     <div className="p-4 flex justify-between items-center hover:bg-gray-50">
         <div className="flex items-center space-x-3">
             {item.type === 'collection' ? <Layers className="w-5 h-5 text-purple-500" /> : <Package className="w-5 h-5 text-blue-500" />}
@@ -135,8 +165,8 @@ const ActivityItem = ({ item }) => (
     </div>
 );
 
-const StatusBadge = ({ status }) => {
-    const styles = {
+const StatusBadge = ({ status }: { status: string }) => {
+    const styles: { [key: string]: string } = {
         pending: 'bg-yellow-100 text-yellow-800',
         processing: 'bg-blue-100 text-blue-800',
         completed: 'bg-green-100 text-green-800',
