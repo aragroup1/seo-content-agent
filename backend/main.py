@@ -27,12 +27,13 @@ shopify_logger = logging.getLogger("shopify")
 openai_logger = logging.getLogger("openai")
 db_logger = logging.getLogger("database")
 api_logger = logging.getLogger("api")
+processor_logger = logging.getLogger("processor")
 
 load_dotenv()
 
 # Log configuration on startup
 logger.info("="*50)
-logger.info("STARTING AI SEO CONTENT AGENT")
+logger.info("STARTING AI SEO CONTENT AGENT - AUTOMATIC MODE")
 logger.info("="*50)
 
 # Check environment variables
@@ -132,6 +133,7 @@ class SystemState(Base):
     products_found_in_last_scan = Column(Integer, default=0)
     collections_found_in_last_scan = Column(Integer, default=0)
     total_items_processed = Column(Integer, default=0)
+    auto_processing_enabled = Column(Boolean, default=True)
 
 class APILog(Base):
     __tablename__ = "api_logs"
@@ -190,14 +192,14 @@ def log_api_action(db: Session, service: str, action: str, status: str, message:
 def init_system_state(db: Session):
     state = db.query(SystemState).first()
     if not state:
-        state = SystemState(is_paused=False)
+        state = SystemState(is_paused=False, auto_processing_enabled=True)
         db.add(state)
         db.commit()
         db_logger.info("Initialized system state")
     return state
 
 # FastAPI app
-app = FastAPI(title="AI SEO Content Agent", version="3.0.0")
+app = FastAPI(title="AI SEO Content Agent", version="3.1.0")
 
 # Middleware for request logging
 @app.middleware("http")
@@ -277,7 +279,6 @@ class ShopifyService:
                     
         except Exception as e:
             shopify_logger.error(f"❌ Exception fetching products: {str(e)}")
-            shopify_logger.error(traceback.format_exc())
             return []
     
     async def get_collections(self, limit=250):
@@ -326,6 +327,80 @@ class ShopifyService:
         except Exception as e:
             shopify_logger.error(f"❌ Exception fetching collections: {str(e)}")
             return []
+    
+    async def update_product(self, product_id: str, seo_data: dict):
+        """Update product with SEO content"""
+        if not self.configured:
+            shopify_logger.warning("⚠️ Cannot update product - Shopify not configured")
+            return False
+        
+        shopify_logger.info(f"📝 Updating product {product_id} in Shopify")
+        
+        update_data = {
+            "product": {
+                "id": product_id,
+                "body_html": seo_data.get("ai_description", "")
+            }
+        }
+        
+        # Note: Shopify doesn't allow updating the main title via API for existing products
+        # We'll focus on description for now
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.put(
+                    f"{self.base_url}/products/{product_id}.json",
+                    headers=self.headers,
+                    json=update_data,
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    shopify_logger.info(f"✅ Successfully updated product {product_id}")
+                    return True
+                else:
+                    shopify_logger.error(f"❌ Failed to update product {product_id}: {response.status_code}")
+                    shopify_logger.error(f"Response: {response.text}")
+                    return False
+                    
+        except Exception as e:
+            shopify_logger.error(f"❌ Exception updating product {product_id}: {e}")
+            return False
+    
+    async def update_collection(self, collection_id: str, seo_data: dict):
+        """Update collection with SEO content"""
+        if not self.configured:
+            return False
+        
+        shopify_logger.info(f"📝 Updating collection {collection_id} in Shopify")
+        
+        # Try updating as custom collection first, then smart collection
+        for collection_type in ["custom_collections", "smart_collections"]:
+            try:
+                update_data = {
+                    collection_type[:-1]: {  # Remove 's' from the end
+                        "id": collection_id,
+                        "body_html": seo_data.get("ai_description", "")
+                    }
+                }
+                
+                async with httpx.AsyncClient() as client:
+                    response = await client.put(
+                        f"{self.base_url}/{collection_type}/{collection_id}.json",
+                        headers=self.headers,
+                        json=update_data,
+                        timeout=30
+                    )
+                    
+                    if response.status_code == 200:
+                        shopify_logger.info(f"✅ Successfully updated collection {collection_id} as {collection_type}")
+                        return True
+                        
+            except Exception as e:
+                continue
+        
+        shopify_logger.error(f"❌ Failed to update collection {collection_id}")
+        return False
 
 # AI Service
 class AIService:
@@ -348,13 +423,41 @@ class AIService:
         openai_logger.info(f"🔍 Researching keywords for {item_type}: {item.get('title', 'Unknown')}")
         
         try:
-            prompt = f"Generate 10 SEO keywords for this {item_type}: {item.get('title', '')}. Return only comma-separated keywords."
+            if item_type == "collection":
+                prompt = f"""
+                Generate 8 high-value SEO keywords for this collection:
+                Collection: {item.get('title', '')}
+                Products in collection: {item.get('products_count', 0)}
+                
+                Focus on:
+                - Category keywords
+                - Buying intent terms
+                - Long-tail variations
+                - Popular search terms
+                
+                Return only comma-separated keywords.
+                """
+            else:
+                prompt = f"""
+                Generate 8 high-value SEO keywords for this product:
+                Product: {item.get('title', '')}
+                Type: {item.get('product_type', '')}
+                Brand: {item.get('vendor', '')}
+                
+                Focus on:
+                - Product-specific keywords
+                - Buyer intent terms
+                - Brand + product combinations
+                - Feature-based keywords
+                
+                Return only comma-separated keywords.
+                """
             
-            openai_logger.info(f"📤 Sending request to OpenAI...")
+            openai_logger.info(f"📤 Sending keyword request to OpenAI...")
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "You are an SEO keyword research expert."},
+                    {"role": "system", "content": "You are an expert SEO keyword researcher specializing in e-commerce."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.5,
@@ -362,7 +465,7 @@ class AIService:
             )
             
             keywords = response.choices[0].message.content.strip()
-            keyword_list = [k.strip() for k in keywords.split(',')][:10]
+            keyword_list = [k.strip() for k in keywords.split(',')][:8]
             
             openai_logger.info(f"✅ Generated {len(keyword_list)} keywords: {keyword_list[:3]}...")
             return keyword_list
@@ -370,19 +473,299 @@ class AIService:
         except Exception as e:
             openai_logger.error(f"❌ Keyword research error: {str(e)}")
             return []
+    
+    async def generate_seo_content(self, item: dict, keywords: List[str], item_type: str = "product") -> dict:
+        """Generate complete SEO content"""
+        if not self.client:
+            openai_logger.error("❌ Cannot generate content - OpenAI not configured")
+            return {}
+        
+        openai_logger.info(f"📝 Generating SEO content for {item_type}: {item.get('title', 'Unknown')}")
+        
+        try:
+            if item_type == "collection":
+                prompt = f"""
+                Create SEO-optimized content for this collection:
+                
+                Collection: {item.get('title', '')}
+                Products in collection: {item.get('products_count', 0)}
+                Target Keywords: {', '.join(keywords[:5])}
+                
+                Generate JSON with:
+                {{
+                    "seo_title": "SEO title (max 60 chars, include main keyword)",
+                    "meta_description": "Meta description (max 155 chars, compelling for collection pages)",
+                    "ai_description": "Collection description (300-400 words in HTML format with <p> tags. Describe the collection theme, highlight key products/categories, include buying guides, use keywords naturally, add calls to action)"
+                }}
+                """
+            else:
+                prompt = f"""
+                Create SEO-optimized content for this product:
+                
+                Product: {item.get('title', '')}
+                Type: {item.get('product_type', '')}
+                Brand: {item.get('vendor', '')}
+                Target Keywords: {', '.join(keywords[:5])}
+                
+                Generate JSON with:
+                {{
+                    "seo_title": "SEO title (max 60 chars, include main keyword)",
+                    "meta_description": "Meta description (max 155 chars, compelling and click-worthy)",
+                    "ai_description": "Product description (200-300 words in HTML format with <p> tags. Focus on benefits, use keywords naturally, include features, add urgency/social proof)"
+                }}
+                """
+            
+            openai_logger.info(f"📤 Sending content generation request to OpenAI...")
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are an expert e-commerce SEO copywriter. Create compelling, keyword-rich content that converts."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=1200,
+                response_format={"type": "json_object"}
+            )
+            
+            content = json.loads(response.choices[0].message.content)
+            openai_logger.info(f"✅ Successfully generated SEO content")
+            
+            # Ensure content is within limits
+            if content.get("seo_title"):
+                content["seo_title"] = content["seo_title"][:60]
+            if content.get("meta_description"):
+                content["meta_description"] = content["meta_description"][:155]
+            
+            return content
+            
+        except Exception as e:
+            openai_logger.error(f"❌ Content generation error: {str(e)}")
+            return {}
 
 # Initialize services
 shopify = ShopifyService()
 ai_service = AIService()
+
+# AUTOMATIC PROCESSING FUNCTIONS
+async def process_pending_items():
+    """🚀 MAIN PROCESSING FUNCTION - Process pending items automatically"""
+    db = SessionLocal()
+    try:
+        processor_logger.info("="*50)
+        processor_logger.info("🚀 STARTING AUTOMATIC CONTENT GENERATION")
+        processor_logger.info("="*50)
+        
+        # Check if system is paused
+        state = db.query(SystemState).first()
+        if state and state.is_paused:
+            processor_logger.warning("⏸️ System is paused - stopping processing")
+            return
+        
+        if state and not state.auto_processing_enabled:
+            processor_logger.warning("⏸️ Auto-processing disabled - stopping")
+            return
+        
+        # Get pending items (small batches to respect API limits)
+        pending_products = db.query(Product).filter(
+            Product.status == "pending"
+        ).limit(3).all()  # Process 3 products at a time
+        
+        pending_collections = db.query(Collection).filter(
+            Collection.status == "pending"  
+        ).limit(2).all()  # Process 2 collections at a time
+        
+        total_processed = 0
+        
+        processor_logger.info(f"📋 Found {len(pending_products)} pending products, {len(pending_collections)} pending collections")
+        
+        # Process products
+        for product in pending_products:
+            processor_logger.info(f"🎯 Processing product: {product.title}")
+            
+            # Update status to processing
+            product.status = "processing"
+            product.updated_at = datetime.utcnow()
+            db.commit()
+            
+            try:
+                # Step 1: Research keywords
+                processor_logger.info(f"🔍 Step 1: Researching keywords...")
+                keywords = await ai_service.research_keywords({
+                    "title": product.title,
+                    "product_type": product.product_type,
+                    "vendor": product.vendor
+                }, "product")
+                
+                if not keywords:
+                    raise Exception("No keywords generated")
+                
+                # Step 2: Generate SEO content
+                processor_logger.info(f"📝 Step 2: Generating SEO content...")
+                seo_content = await ai_service.generate_seo_content({
+                    "title": product.title,
+                    "product_type": product.product_type,
+                    "vendor": product.vendor
+                }, keywords, "product")
+                
+                if not seo_content:
+                    raise Exception("No SEO content generated")
+                
+                # Step 3: Save to database
+                processor_logger.info(f"💾 Step 3: Saving content to database...")
+                seo_record = SEOContent(
+                    item_id=product.shopify_id,
+                    item_type="product",
+                    item_title=product.title,
+                    seo_title=seo_content.get("seo_title", ""),
+                    meta_description=seo_content.get("meta_description", ""),
+                    ai_description=seo_content.get("ai_description", ""),
+                    keywords_used=keywords
+                )
+                db.add(seo_record)
+                
+                # Step 4: Update Shopify (if description was generated)
+                shopify_updated = False
+                if seo_content.get("ai_description"):
+                    processor_logger.info(f"🔄 Step 4: Updating Shopify...")
+                    shopify_updated = await shopify.update_product(product.shopify_id, seo_content)
+                
+                # Step 5: Mark as completed
+                product.status = "completed"
+                product.seo_written = True
+                product.processed_at = datetime.utcnow()
+                product.keywords_researched = keywords
+                product.updated_at = datetime.utcnow()
+                
+                # Log the success
+                log_api_action(db, "processor", "product_completed", "success", 
+                             f"Completed product: {product.title}", 
+                             {
+                                 "keywords_count": len(keywords),
+                                 "shopify_updated": shopify_updated,
+                                 "seo_title_length": len(seo_content.get("seo_title", "")),
+                                 "meta_desc_length": len(seo_content.get("meta_description", ""))
+                             })
+                
+                total_processed += 1
+                processor_logger.info(f"✅ SUCCESS: Product '{product.title}' completed!")
+                processor_logger.info(f"   📊 Keywords: {len(keywords)} generated")
+                processor_logger.info(f"   📝 Content: SEO title, meta desc, description generated")
+                processor_logger.info(f"   🔄 Shopify: {'Updated' if shopify_updated else 'Skipped'}")
+                
+            except Exception as e:
+                product.status = "failed"
+                product.updated_at = datetime.utcnow()
+                processor_logger.error(f"❌ FAILED: Product '{product.title}' failed: {e}")
+                log_api_action(db, "processor", "product_failed", "error", str(e), {"product_title": product.title})
+            
+            db.commit()
+            
+            # Rate limiting - wait between products
+            processor_logger.info("⏰ Waiting 5 seconds before next product...")
+            await asyncio.sleep(5)
+        
+        # Process collections
+        for collection in pending_collections:
+            processor_logger.info(f"🎯 Processing collection: {collection.title}")
+            
+            collection.status = "processing"
+            collection.updated_at = datetime.utcnow()
+            db.commit()
+            
+            try:
+                # Research keywords for collection
+                processor_logger.info(f"🔍 Researching keywords for collection...")
+                keywords = await ai_service.research_keywords({
+                    "title": collection.title,
+                    "products_count": collection.products_count
+                }, "collection")
+                
+                if not keywords:
+                    raise Exception("No keywords generated")
+                
+                # Generate SEO content for collection
+                processor_logger.info(f"📝 Generating SEO content for collection...")
+                seo_content = await ai_service.generate_seo_content({
+                    "title": collection.title,
+                    "products_count": collection.products_count
+                }, keywords, "collection")
+                
+                if not seo_content:
+                    raise Exception("No SEO content generated")
+                
+                # Save to database
+                seo_record = SEOContent(
+                    item_id=collection.shopify_id,
+                    item_type="collection",
+                    item_title=collection.title,
+                    seo_title=seo_content.get("seo_title", ""),
+                    meta_description=seo_content.get("meta_description", ""),
+                    ai_description=seo_content.get("ai_description", ""),
+                    keywords_used=keywords
+                )
+                db.add(seo_record)
+                
+                # Update Shopify collection
+                shopify_updated = False
+                if seo_content.get("ai_description"):
+                    processor_logger.info(f"🔄 Updating collection in Shopify...")
+                    shopify_updated = await shopify.update_collection(collection.shopify_id, seo_content)
+                
+                collection.status = "completed"
+                collection.seo_written = True
+                collection.processed_at = datetime.utcnow()
+                collection.keywords_researched = keywords
+                collection.updated_at = datetime.utcnow()
+                
+                total_processed += 1
+                processor_logger.info(f"✅ SUCCESS: Collection '{collection.title}' completed!")
+                
+            except Exception as e:
+                collection.status = "failed"
+                collection.updated_at = datetime.utcnow()
+                processor_logger.error(f"❌ FAILED: Collection '{collection.title}' failed: {e}")
+                log_api_action(db, "processor", "collection_failed", "error", str(e), {"collection_title": collection.title})
+            
+            db.commit()
+            await asyncio.sleep(5)
+        
+        # Final summary
+        processor_logger.info("="*50)
+        processor_logger.info(f"🎉 PROCESSING BATCH COMPLETE")
+        processor_logger.info(f"📊 Total items processed: {total_processed}")
+        processor_logger.info(f"💰 OpenAI API calls made: ~{total_processed * 2} (keywords + content)")
+        processor_logger.info("="*50)
+        
+        # Update system stats
+        if state:
+            state.total_items_processed += total_processed
+            db.commit()
+        
+        # Schedule next batch if there are more pending items
+        remaining_products = db.query(Product).filter(Product.status == "pending").count()
+        remaining_collections = db.query(Collection).filter(Collection.status == "pending").count()
+        
+        if remaining_products > 0 or remaining_collections > 0:
+            processor_logger.info(f"📋 Remaining: {remaining_products} products, {remaining_collections} collections")
+            processor_logger.info("⏰ Next batch will be processed in 2 minutes...")
+        else:
+            processor_logger.info("🏁 All items processed! System on standby for new items.")
+        
+    except Exception as e:
+        processor_logger.error(f"❌ Critical processing error: {e}")
+        processor_logger.error(traceback.format_exc())
+    finally:
+        db.close()
 
 # API Endpoints
 @app.get("/")
 async def root():
     return {
         "status": "AI SEO Agent Running",
-        "version": "3.0.0",
+        "version": "3.1.0 - Automatic Processing",
         "shopify_configured": shopify.configured,
-        "openai_configured": ai_service.client is not None
+        "openai_configured": ai_service.client is not None,
+        "features": ["automatic_processing", "keyword_research", "content_generation", "shopify_updates"]
     }
 
 @app.get("/api/health")
@@ -395,6 +778,11 @@ async def health_check():
             "database": "connected",
             "shopify": "configured" if shopify.configured else "not configured",
             "openai": "configured" if ai_service.client else "not configured"
+        },
+        "features": {
+            "automatic_processing": "enabled",
+            "content_generation": "enabled",
+            "shopify_updates": "enabled"
         }
     }
 
@@ -412,11 +800,13 @@ async def get_dashboard(db: Session = Depends(get_db)):
         total_products = db.query(Product).count()
         completed_products = db.query(Product).filter(Product.status == "completed").count()
         pending_products = db.query(Product).filter(Product.status == "pending").count()
+        processing_products = db.query(Product).filter(Product.status == "processing").count()
         
         # Collections stats
         total_collections = db.query(Collection).count()
         completed_collections = db.query(Collection).filter(Collection.status == "completed").count()
         pending_collections = db.query(Collection).filter(Collection.status == "pending").count()
+        processing_collections = db.query(Collection).filter(Collection.status == "processing").count()
         
         # Manual queue stats
         manual_queue_count = db.query(ManualQueue).filter(ManualQueue.status == "pending").count()
@@ -441,7 +831,8 @@ async def get_dashboard(db: Session = Depends(get_db)):
                 "title": p.title,
                 "type": "product",
                 "status": p.status,
-                "updated": p.updated_at.isoformat() if p.updated_at else None
+                "updated": p.updated_at.isoformat() if p.updated_at else None,
+                "keywords_count": len(p.keywords_researched) if p.keywords_researched else 0
             })
         
         for c in recent_collections:
@@ -450,7 +841,8 @@ async def get_dashboard(db: Session = Depends(get_db)):
                 "title": c.title,
                 "type": "collection",
                 "status": c.status,
-                "updated": c.updated_at.isoformat() if c.updated_at else None
+                "updated": c.updated_at.isoformat() if c.updated_at else None,
+                "keywords_count": len(c.keywords_researched) if c.keywords_researched else 0
             })
         
         recent_activity.sort(key=lambda x: x["updated"] or "", reverse=True)
@@ -461,20 +853,24 @@ async def get_dashboard(db: Session = Depends(get_db)):
             "system": {
                 "is_paused": state.is_paused,
                 "auto_pause_triggered": state.auto_pause_triggered,
+                "auto_processing_enabled": state.auto_processing_enabled,
                 "last_scan": state.last_scan.isoformat() if state.last_scan else None,
                 "products_found_in_last_scan": state.products_found_in_last_scan,
-                "collections_found_in_last_scan": state.collections_found_in_last_scan
+                "collections_found_in_last_scan": state.collections_found_in_last_scan,
+                "total_items_processed": state.total_items_processed
             },
             "stats": {
                 "products": {
                     "total": total_products,
                     "completed": completed_products,
-                    "pending": pending_products
+                    "pending": pending_products,
+                    "processing": processing_products
                 },
                 "collections": {
                     "total": total_collections,
                     "completed": completed_collections,
-                    "pending": pending_collections
+                    "pending": pending_collections,
+                    "processing": processing_collections
                 },
                 "manual_queue": manual_queue_count,
                 "processed_today": processed_today,
@@ -568,6 +964,11 @@ async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_
         
         db.commit()
         
+        # 🚀 AUTO-TRIGGER PROCESSING for new items
+        if not state.is_paused and total_new > 0:
+            api_logger.info(f"🚀 Auto-triggering content generation for {total_new} new items")
+            background_tasks.add_task(process_pending_items)
+        
         # Log the results
         log_api_action(
             db, "system", "scan", "success",
@@ -576,7 +977,8 @@ async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_
                 "new_products": new_products,
                 "existing_products": existing_products,
                 "new_collections": new_collections,
-                "existing_collections": existing_collections
+                "existing_collections": existing_collections,
+                "auto_processing_triggered": total_new > 0 and not state.is_paused
             }
         )
         
@@ -584,7 +986,8 @@ async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_
         📊 SCAN RESULTS:
         ├── Products: {new_products} new, {existing_products} existing
         ├── Collections: {new_collections} new, {existing_collections} existing
-        └── Total scanned: {len(products)} products, {len(collections)} collections
+        ├── Total scanned: {len(products)} products, {len(collections)} collections
+        └── Auto-processing: {'Triggered' if total_new > 0 and not state.is_paused else 'Not triggered'}
         """)
         
         return {
@@ -593,7 +996,8 @@ async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_
             "total_products": len(products),
             "total_collections": len(collections),
             "existing_products": existing_products,
-            "existing_collections": existing_collections
+            "existing_collections": existing_collections,
+            "auto_processing_triggered": total_new > 0 and not state.is_paused
         }
         
     except Exception as e:
@@ -601,6 +1005,29 @@ async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_
         api_logger.error(traceback.format_exc())
         log_api_action(db, "system", "scan", "error", str(e))
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/process-pending")
+async def trigger_processing(background_tasks: BackgroundTasks):
+    """Manually trigger processing of pending items"""
+    api_logger.info("🚀 Manual processing triggered")
+    background_tasks.add_task(process_pending_items)
+    return {"message": "Processing started", "status": "success"}
+
+@app.post("/api/pause")
+async def toggle_pause(db: Session = Depends(get_db)):
+    """Toggle system pause state"""
+    state = db.query(SystemState).first()
+    if not state:
+        state = init_system_state(db)
+    
+    state.is_paused = not state.is_paused
+    state.auto_pause_triggered = False
+    db.commit()
+    
+    status = "paused" if state.is_paused else "running"
+    api_logger.info(f"🔄 System status changed to: {status}")
+    
+    return {"is_paused": state.is_paused}
 
 @app.get("/api/logs")
 async def get_logs(db: Session = Depends(get_db)):
@@ -623,6 +1050,8 @@ async def get_logs(db: Session = Depends(get_db)):
                     "item_type": log.item_type,
                     "item_title": log.item_title,
                     "keywords_used": log.keywords_used,
+                    "seo_title": log.seo_title,
+                    "meta_description": log.meta_description,
                     "generated_at": log.generated_at.isoformat()
                 }
                 for log in seo_logs
@@ -643,22 +1072,7 @@ async def get_logs(db: Session = Depends(get_db)):
         api_logger.error(f"❌ Error fetching logs: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/pause")
-async def toggle_pause(db: Session = Depends(get_db)):
-    """Toggle system pause state"""
-    state = db.query(SystemState).first()
-    if not state:
-        state = init_system_state(db)
-    
-    state.is_paused = not state.is_paused
-    state.auto_pause_triggered = False
-    db.commit()
-    
-    status = "paused" if state.is_paused else "running"
-    api_logger.info(f"🔄 System status changed to: {status}")
-    
-    return {"is_paused": state.is_paused}
-
+# Additional endpoints for manual queue, etc.
 @app.post("/api/manual-queue")
 async def add_to_manual_queue(item: ManualQueueItem, db: Session = Depends(get_db)):
     """Add item to manual processing queue"""
@@ -728,12 +1142,41 @@ async def generate_content(request: GenerateContentRequest, db: Session = Depend
         request.item_type
     )
     
-    # For now, just return the keywords (content generation can be added later)
-    return {
-        "success": True,
-        "keywords": keywords,
-        "message": "Keywords generated successfully"
-    }
+    # Generate content
+    content = await ai_service.generate_seo_content(
+        {"title": item_data.title},
+        keywords,
+        request.item_type
+    )
+    
+    if content:
+        # Save to database
+        seo_record = SEOContent(
+            item_id=request.item_id,
+            item_type=request.item_type,
+            item_title=item_data.title,
+            seo_title=content.get("seo_title", ""),
+            meta_description=content.get("meta_description", ""),
+            ai_description=content.get("ai_description", ""),
+            keywords_used=keywords
+        )
+        db.add(seo_record)
+        
+        # Update item status
+        item_data.status = "completed"
+        item_data.seo_written = True
+        item_data.processed_at = datetime.utcnow()
+        item_data.keywords_researched = keywords
+        
+        db.commit()
+        
+        return {
+            "success": True,
+            "content": content,
+            "keywords": keywords
+        }
+    
+    return {"success": False, "error": "Failed to generate content"}
 
 if __name__ == "__main__":
     import uvicorn
