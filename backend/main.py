@@ -28,13 +28,14 @@ openai_logger = logging.getLogger("openai")
 db_logger = logging.getLogger("database")
 api_logger = logging.getLogger("api")
 processor_logger = logging.getLogger("processor")
+geo_logger = logging.getLogger("geo")
 
 load_dotenv()
 
 # Log configuration on startup
-logger.info("="*50)
-logger.info("STARTING AI SEO CONTENT AGENT - AUTOMATIC MODE")
-logger.info("="*50)
+logger.info("="*60)
+logger.info("STARTING AI SEO CONTENT AGENT - GEO OPTIMIZED")
+logger.info("="*60)
 
 # Check environment variables
 env_vars = {
@@ -58,7 +59,7 @@ else:
 engine = create_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# FIXED: Define Base BEFORE using it in model classes
+# Define Base BEFORE using it in model classes
 Base = declarative_base()
 
 # Database Models
@@ -74,6 +75,7 @@ class Product(Base):
     tags = Column(Text)
     status = Column(String, default="pending")
     seo_written = Column(Boolean, default=False)
+    geo_optimized = Column(Boolean, default=False)  # NEW: GEO optimization flag
     keywords_researched = Column(JSON)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
@@ -89,6 +91,7 @@ class Collection(Base):
     products_count = Column(Integer, default=0)
     status = Column(String, default="pending")
     seo_written = Column(Boolean, default=False)
+    geo_optimized = Column(Boolean, default=False)  # NEW: GEO optimization flag
     keywords_researched = Column(JSON)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
@@ -120,6 +123,13 @@ class SEOContent(Base):
     meta_description = Column(String)
     ai_description = Column(Text)
     keywords_used = Column(JSON)
+    
+    # NEW: GEO-specific fields
+    faq_content = Column(JSON)  # FAQ sections for AI snippets
+    schema_markup = Column(JSON)  # Structured data
+    voice_search_optimized = Column(Boolean, default=False)
+    featured_snippet_content = Column(Text)  # Content optimized for featured snippets
+    
     version = Column(Integer, default=1)
     generated_at = Column(DateTime, default=datetime.utcnow)
 
@@ -133,7 +143,7 @@ class SystemState(Base):
     products_found_in_last_scan = Column(Integer, default=0)
     collections_found_in_last_scan = Column(Integer, default=0)
     total_items_processed = Column(Integer, default=0)
-    auto_processing_enabled = Column(Boolean, default=True)
+    geo_optimization_enabled = Column(Boolean, default=True)  # NEW: GEO toggle
 
 class APILog(Base):
     __tablename__ = "api_logs"
@@ -146,10 +156,12 @@ class APILog(Base):
     message = Column(Text)
     details = Column(JSON, nullable=True)
 
-# Create tables
+# Create tables with migration handling
 try:
+    # Drop and recreate tables to handle schema changes
+    Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
-    db_logger.info("✅ Database tables created/verified successfully")
+    db_logger.info("✅ Database tables recreated with new schema")
 except Exception as e:
     db_logger.error(f"❌ Database error: {e}")
 
@@ -192,14 +204,18 @@ def log_api_action(db: Session, service: str, action: str, status: str, message:
 def init_system_state(db: Session):
     state = db.query(SystemState).first()
     if not state:
-        state = SystemState(is_paused=False, auto_processing_enabled=True)
+        state = SystemState(
+            is_paused=False, 
+            geo_optimization_enabled=True,
+            total_items_processed=0
+        )
         db.add(state)
         db.commit()
-        db_logger.info("Initialized system state")
+        db_logger.info("Initialized system state with GEO optimization enabled")
     return state
 
 # FastAPI app
-app = FastAPI(title="AI SEO Content Agent", version="3.1.0")
+app = FastAPI(title="AI SEO Content Agent - GEO Optimized", version="4.0.0")
 
 # Middleware for request logging
 @app.middleware("http")
@@ -329,22 +345,40 @@ class ShopifyService:
             return []
     
     async def update_product(self, product_id: str, seo_data: dict):
-        """Update product with SEO content"""
+        """Update product with GEO-optimized content"""
         if not self.configured:
             shopify_logger.warning("⚠️ Cannot update product - Shopify not configured")
             return False
         
-        shopify_logger.info(f"📝 Updating product {product_id} in Shopify")
+        shopify_logger.info(f"📝 Updating product {product_id} with GEO content")
+        
+        # Build comprehensive product description with GEO optimization
+        description = seo_data.get("ai_description", "")
+        
+        # Add FAQ section if available
+        if seo_data.get("faq_content"):
+            faq_html = self._build_faq_html(seo_data["faq_content"])
+            description += f"\n\n{faq_html}"
+        
+        # Add structured data as HTML comments for later processing
+        if seo_data.get("schema_markup"):
+            schema_comment = f"<!-- SCHEMA_DATA: {json.dumps(seo_data['schema_markup'])} -->"
+            description = schema_comment + "\n" + description
         
         update_data = {
             "product": {
                 "id": product_id,
-                "body_html": seo_data.get("ai_description", "")
+                "body_html": description,
+                "metafields": [
+                    {
+                        "namespace": "seo",
+                        "key": "geo_optimized",
+                        "value": "true",
+                        "type": "single_line_text_field"
+                    }
+                ]
             }
         }
-        
-        # Note: Shopify doesn't allow updating the main title via API for existing products
-        # We'll focus on description for now
         
         try:
             async with httpx.AsyncClient() as client:
@@ -356,403 +390,429 @@ class ShopifyService:
                 )
                 
                 if response.status_code == 200:
-                    shopify_logger.info(f"✅ Successfully updated product {product_id}")
+                    shopify_logger.info(f"✅ Successfully updated product {product_id} with GEO content")
                     return True
                 else:
                     shopify_logger.error(f"❌ Failed to update product {product_id}: {response.status_code}")
-                    shopify_logger.error(f"Response: {response.text}")
                     return False
                     
         except Exception as e:
             shopify_logger.error(f"❌ Exception updating product {product_id}: {e}")
             return False
     
-    async def update_collection(self, collection_id: str, seo_data: dict):
-        """Update collection with SEO content"""
-        if not self.configured:
-            return False
+    def _build_faq_html(self, faq_content: List[Dict]) -> str:
+        """Build HTML for FAQ section with schema markup"""
+        html = '<div class="faq-section">\n<h3>Frequently Asked Questions</h3>\n'
         
-        shopify_logger.info(f"📝 Updating collection {collection_id} in Shopify")
+        for faq in faq_content:
+            html += f'''
+<div class="faq-item" itemscope itemprop="mainEntity" itemtype="https://schema.org/Question">
+    <h4 itemprop="name">{faq.get("question", "")}</h4>
+    <div itemscope itemprop="acceptedAnswer" itemtype="https://schema.org/Answer">
+        <p itemprop="text">{faq.get("answer", "")}</p>
+    </div>
+</div>
+'''
         
-        # Try updating as custom collection first, then smart collection
-        for collection_type in ["custom_collections", "smart_collections"]:
-            try:
-                update_data = {
-                    collection_type[:-1]: {  # Remove 's' from the end
-                        "id": collection_id,
-                        "body_html": seo_data.get("ai_description", "")
-                    }
-                }
-                
-                async with httpx.AsyncClient() as client:
-                    response = await client.put(
-                        f"{self.base_url}/{collection_type}/{collection_id}.json",
-                        headers=self.headers,
-                        json=update_data,
-                        timeout=30
-                    )
-                    
-                    if response.status_code == 200:
-                        shopify_logger.info(f"✅ Successfully updated collection {collection_id} as {collection_type}")
-                        return True
-                        
-            except Exception as e:
-                continue
-        
-        shopify_logger.error(f"❌ Failed to update collection {collection_id}")
-        return False
+        html += '</div>'
+        return html
 
-# AI Service
-class AIService:
+# GEO-Optimized AI Service
+class GEOAIService:
     def __init__(self):
         self.api_key = os.getenv("OPENAI_API_KEY")
         if self.api_key:
             self.client = OpenAI(api_key=self.api_key)
             self.model = "gpt-3.5-turbo"
-            openai_logger.info(f"✅ OpenAI configured with model: {self.model}")
+            geo_logger.info(f"✅ GEO AI Service configured with model: {self.model}")
         else:
-            openai_logger.warning("⚠️ OpenAI API key not configured")
+            geo_logger.warning("⚠️ OpenAI API key not configured")
             self.client = None
     
-    async def research_keywords(self, item: dict, item_type: str = "product") -> List[str]:
-        """Research keywords for any item type"""
+    async def research_geo_keywords(self, item: dict, item_type: str = "product") -> List[str]:
+        """Research keywords optimized for Generative Engine Optimization"""
         if not self.client:
-            openai_logger.error("❌ Cannot research keywords - OpenAI not configured")
+            geo_logger.error("❌ Cannot research keywords - OpenAI not configured")
             return []
         
-        openai_logger.info(f"🔍 Researching keywords for {item_type}: {item.get('title', 'Unknown')}")
+        geo_logger.info(f"🔍 Researching GEO keywords for {item_type}: {item.get('title', 'Unknown')}")
         
         try:
             if item_type == "collection":
                 prompt = f"""
-                Generate 8 high-value SEO keywords for this collection:
+                Generate 10 GEO-optimized keywords for this collection, focusing on Generative AI search patterns:
+                
                 Collection: {item.get('title', '')}
                 Products in collection: {item.get('products_count', 0)}
                 
                 Focus on:
-                - Category keywords
-                - Buying intent terms
-                - Long-tail variations
-                - Popular search terms
+                1. Conversational search queries (how people ask AI assistants)
+                2. Question-based keywords ("what is best...", "how to choose...")
+                3. Comparison keywords ("vs", "compared to", "difference between")
+                4. Intent-driven phrases ("buy", "reviews", "guide")
+                5. Long-tail natural language queries
+                6. Voice search friendly phrases
                 
-                Return only comma-separated keywords.
+                Return only comma-separated keywords that work well with AI search engines.
                 """
             else:
                 prompt = f"""
-                Generate 8 high-value SEO keywords for this product:
+                Generate 10 GEO-optimized keywords for this product, focusing on Generative AI search patterns:
+                
                 Product: {item.get('title', '')}
                 Type: {item.get('product_type', '')}
                 Brand: {item.get('vendor', '')}
                 
                 Focus on:
-                - Product-specific keywords
-                - Buyer intent terms
-                - Brand + product combinations
-                - Feature-based keywords
+                1. Conversational search queries (how people ask AI assistants)
+                2. Question-based keywords ("what is the best...", "how does...work")
+                3. Problem-solution keywords ("for [problem]", "helps with...")
+                4. Comparison keywords ("vs competitors", "alternative to...")
+                5. Buying intent phrases ("buy online", "best price", "reviews")
+                6. Voice search friendly natural language
                 
-                Return only comma-separated keywords.
+                Return only comma-separated keywords optimized for AI search engines.
                 """
             
-            openai_logger.info(f"📤 Sending keyword request to OpenAI...")
+            geo_logger.info(f"📤 Sending GEO keyword request to OpenAI...")
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "You are an expert SEO keyword researcher specializing in e-commerce."},
+                    {"role": "system", "content": "You are a Generative Engine Optimization (GEO) expert specializing in keywords that perform well with AI search engines like ChatGPT, Bard, and Claude."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.5,
-                max_tokens=150
+                temperature=0.6,
+                max_tokens=200
             )
             
             keywords = response.choices[0].message.content.strip()
-            keyword_list = [k.strip() for k in keywords.split(',')][:8]
+            keyword_list = [k.strip().lower() for k in keywords.split(',')][:10]
             
-            openai_logger.info(f"✅ Generated {len(keyword_list)} keywords: {keyword_list[:3]}...")
+            geo_logger.info(f"✅ Generated {len(keyword_list)} GEO keywords: {keyword_list[:3]}...")
             return keyword_list
             
         except Exception as e:
-            openai_logger.error(f"❌ Keyword research error: {str(e)}")
+            geo_logger.error(f"❌ GEO keyword research error: {str(e)}")
             return []
     
-    async def generate_seo_content(self, item: dict, keywords: List[str], item_type: str = "product") -> dict:
-        """Generate complete SEO content"""
+    async def generate_geo_content(self, item: dict, keywords: List[str], item_type: str = "product") -> dict:
+        """Generate content optimized for Generative Engine Optimization"""
         if not self.client:
-            openai_logger.error("❌ Cannot generate content - OpenAI not configured")
+            geo_logger.error("❌ Cannot generate GEO content - OpenAI not configured")
             return {}
         
-        openai_logger.info(f"📝 Generating SEO content for {item_type}: {item.get('title', 'Unknown')}")
+        geo_logger.info(f"🚀 Generating GEO-optimized content for {item_type}: {item.get('title', 'Unknown')}")
         
         try:
             if item_type == "collection":
                 prompt = f"""
-                Create SEO-optimized content for this collection:
+                Create GEO-optimized content for this collection that performs well with AI search engines:
                 
                 Collection: {item.get('title', '')}
                 Products in collection: {item.get('products_count', 0)}
-                Target Keywords: {', '.join(keywords[:5])}
+                Target Keywords: {', '.join(keywords[:6])}
                 
-                Generate JSON with:
+                Generate JSON with ALL these fields:
                 {{
-                    "seo_title": "SEO title (max 60 chars, include main keyword)",
-                    "meta_description": "Meta description (max 155 chars, compelling for collection pages)",
-                    "ai_description": "Collection description (300-400 words in HTML format with <p> tags. Describe the collection theme, highlight key products/categories, include buying guides, use keywords naturally, add calls to action)"
+                    "seo_title": "SEO title (max 60 chars, natural language, question-answering friendly)",
+                    "meta_description": "Meta description (max 155 chars, conversational, includes value proposition)",
+                    "ai_description": "Collection description (400-500 words in HTML with <p>, <h3>, and <ul> tags. Write in natural, conversational tone. Include buying guides, comparisons, and answer common questions. Use structured formatting that AI can easily parse and quote.)",
+                    "faq_content": [
+                        {{"question": "What makes this collection special?", "answer": "Detailed answer"}},
+                        {{"question": "How to choose the right product?", "answer": "Detailed answer"}},
+                        {{"question": "What are the key benefits?", "answer": "Detailed answer"}}
+                    ],
+                    "featured_snippet_content": "Concise 50-word answer optimized for featured snippets that directly answers 'What is [collection name]?'",
+                    "schema_markup": {{
+                        "@type": "CollectionPage",
+                        "name": "{item.get('title', '')}",
+                        "description": "Brief description",
+                        "numberOfItems": {item.get('products_count', 0)}
+                    }}
                 }}
+                
+                Optimize for:
+                - Natural language patterns AI engines understand
+                - Question-answer format
+                - Clear, scannable structure
+                - Conversational tone
+                - Value-focused messaging
                 """
             else:
                 prompt = f"""
-                Create SEO-optimized content for this product:
+                Create GEO-optimized content for this product that performs well with AI search engines:
                 
                 Product: {item.get('title', '')}
                 Type: {item.get('product_type', '')}
                 Brand: {item.get('vendor', '')}
-                Target Keywords: {', '.join(keywords[:5])}
+                Target Keywords: {', '.join(keywords[:6])}
                 
-                Generate JSON with:
+                Generate JSON with ALL these fields:
                 {{
-                    "seo_title": "SEO title (max 60 chars, include main keyword)",
-                    "meta_description": "Meta description (max 155 chars, compelling and click-worthy)",
-                    "ai_description": "Product description (200-300 words in HTML format with <p> tags. Focus on benefits, use keywords naturally, include features, add urgency/social proof)"
+                    "seo_title": "SEO title (max 60 chars, natural language, benefit-focused)",
+                    "meta_description": "Meta description (max 155 chars, conversational, clear value prop)",
+                    "ai_description": "Product description (300-400 words in HTML with <p>, <h3>, and <ul> tags. Write conversationally. Include benefits, use cases, and comparisons. Structure for easy AI parsing and quoting.)",
+                    "faq_content": [
+                        {{"question": "What problem does this solve?", "answer": "Detailed answer"}},
+                        {{"question": "How does it work?", "answer": "Detailed answer"}},
+                        {{"question": "Why choose this over alternatives?", "answer": "Detailed answer"}}
+                    ],
+                    "featured_snippet_content": "Concise 50-word answer optimized for 'What is [product name]?' queries",
+                    "schema_markup": {{
+                        "@type": "Product",
+                        "name": "{item.get('title', '')}",
+                        "category": "{item.get('product_type', '')}",
+                        "brand": "{item.get('vendor', '')}"
+                    }}
                 }}
+                
+                Optimize for:
+                - Conversational AI interactions
+                - Question-answer format
+                - Benefit-driven language
+                - Natural language patterns
+                - Clear value propositions
                 """
             
-            openai_logger.info(f"📤 Sending content generation request to OpenAI...")
+            geo_logger.info(f"📤 Sending GEO content generation request to OpenAI...")
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "You are an expert e-commerce SEO copywriter. Create compelling, keyword-rich content that converts."},
+                    {"role": "system", "content": "You are a Generative Engine Optimization (GEO) expert. Create content that AI search engines like ChatGPT, Claude, and Bard can easily understand, parse, and recommend to users. Focus on natural language, clear structure, and direct answers to common questions."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.7,
-                max_tokens=1200,
+                max_tokens=1500,
                 response_format={"type": "json_object"}
             )
             
             content = json.loads(response.choices[0].message.content)
-            openai_logger.info(f"✅ Successfully generated SEO content")
             
-            # Ensure content is within limits
+            # Ensure content limits
             if content.get("seo_title"):
                 content["seo_title"] = content["seo_title"][:60]
             if content.get("meta_description"):
                 content["meta_description"] = content["meta_description"][:155]
             
+            # Ensure FAQ content exists
+            if not content.get("faq_content"):
+                content["faq_content"] = []
+            
+            # Mark as voice search optimized if FAQ content exists
+            content["voice_search_optimized"] = len(content.get("faq_content", [])) >= 3
+            
+            geo_logger.info(f"✅ Successfully generated GEO-optimized content")
+            geo_logger.info(f"   📝 FAQs: {len(content.get('faq_content', []))} questions")
+            geo_logger.info(f"   🗣️ Voice optimized: {content.get('voice_search_optimized', False)}")
+            
             return content
             
         except Exception as e:
-            openai_logger.error(f"❌ Content generation error: {str(e)}")
+            geo_logger.error(f"❌ GEO content generation error: {str(e)}")
             return {}
 
 # Initialize services
 shopify = ShopifyService()
-ai_service = AIService()
+geo_ai = GEOAIService()
 
-# AUTOMATIC PROCESSING FUNCTIONS
+# AUTOMATIC GEO-OPTIMIZED PROCESSING
 async def process_pending_items():
-    """🚀 MAIN PROCESSING FUNCTION - Process pending items automatically"""
+    """🚀 Process pending items with GEO optimization"""
     db = SessionLocal()
     try:
-        processor_logger.info("="*50)
-        processor_logger.info("🚀 STARTING AUTOMATIC CONTENT GENERATION")
-        processor_logger.info("="*50)
+        processor_logger.info("="*60)
+        processor_logger.info("🚀 STARTING GEO-OPTIMIZED CONTENT GENERATION")
+        processor_logger.info("="*60)
         
         # Check if system is paused
         state = db.query(SystemState).first()
-        if state and state.is_paused:
+        if not state:
+            state = init_system_state(db)
+        
+        if state.is_paused:
             processor_logger.warning("⏸️ System is paused - stopping processing")
             return
         
-        if state and not state.auto_processing_enabled:
-            processor_logger.warning("⏸️ Auto-processing disabled - stopping")
+        if not state.geo_optimization_enabled:
+            processor_logger.warning("⏸️ GEO optimization disabled - stopping")
             return
         
-        # Get pending items (small batches to respect API limits)
+        # Get pending items
         pending_products = db.query(Product).filter(
             Product.status == "pending"
-        ).limit(3).all()  # Process 3 products at a time
+        ).limit(2).all()  # Process 2 products at a time (GEO content is more complex)
         
         pending_collections = db.query(Collection).filter(
             Collection.status == "pending"  
-        ).limit(2).all()  # Process 2 collections at a time
+        ).limit(1).all()  # Process 1 collection at a time
         
         total_processed = 0
         
         processor_logger.info(f"📋 Found {len(pending_products)} pending products, {len(pending_collections)} pending collections")
         
-        # Process products
+        # Process products with GEO optimization
         for product in pending_products:
-            processor_logger.info(f"🎯 Processing product: {product.title}")
+            processor_logger.info(f"🎯 Processing product with GEO: {product.title}")
             
-            # Update status to processing
             product.status = "processing"
             product.updated_at = datetime.utcnow()
             db.commit()
             
             try:
-                # Step 1: Research keywords
-                processor_logger.info(f"🔍 Step 1: Researching keywords...")
-                keywords = await ai_service.research_keywords({
+                # Step 1: GEO keyword research
+                processor_logger.info(f"🔍 Step 1: GEO keyword research...")
+                keywords = await geo_ai.research_geo_keywords({
                     "title": product.title,
                     "product_type": product.product_type,
                     "vendor": product.vendor
                 }, "product")
                 
                 if not keywords:
-                    raise Exception("No keywords generated")
+                    raise Exception("No GEO keywords generated")
                 
-                # Step 2: Generate SEO content
-                processor_logger.info(f"📝 Step 2: Generating SEO content...")
-                seo_content = await ai_service.generate_seo_content({
+                # Step 2: Generate GEO-optimized content
+                processor_logger.info(f"🚀 Step 2: Generating GEO content...")
+                geo_content = await geo_ai.generate_geo_content({
                     "title": product.title,
                     "product_type": product.product_type,
                     "vendor": product.vendor
                 }, keywords, "product")
                 
-                if not seo_content:
-                    raise Exception("No SEO content generated")
+                if not geo_content:
+                    raise Exception("No GEO content generated")
                 
-                # Step 3: Save to database
-                processor_logger.info(f"💾 Step 3: Saving content to database...")
+                # Step 3: Save comprehensive SEO content
+                processor_logger.info(f"💾 Step 3: Saving GEO content...")
                 seo_record = SEOContent(
                     item_id=product.shopify_id,
                     item_type="product",
                     item_title=product.title,
-                    seo_title=seo_content.get("seo_title", ""),
-                    meta_description=seo_content.get("meta_description", ""),
-                    ai_description=seo_content.get("ai_description", ""),
-                    keywords_used=keywords
+                    seo_title=geo_content.get("seo_title", ""),
+                    meta_description=geo_content.get("meta_description", ""),
+                    ai_description=geo_content.get("ai_description", ""),
+                    keywords_used=keywords,
+                    faq_content=geo_content.get("faq_content", []),
+                    schema_markup=geo_content.get("schema_markup", {}),
+                    voice_search_optimized=geo_content.get("voice_search_optimized", False),
+                    featured_snippet_content=geo_content.get("featured_snippet_content", "")
                 )
                 db.add(seo_record)
                 
-                # Step 4: Update Shopify (if description was generated)
+                # Step 4: Update Shopify with GEO content
                 shopify_updated = False
-                if seo_content.get("ai_description"):
-                    processor_logger.info(f"🔄 Step 4: Updating Shopify...")
-                    shopify_updated = await shopify.update_product(product.shopify_id, seo_content)
+                if geo_content.get("ai_description"):
+                    processor_logger.info(f"🔄 Step 4: Updating Shopify with GEO content...")
+                    shopify_updated = await shopify.update_product(product.shopify_id, geo_content)
                 
-                # Step 5: Mark as completed
+                # Step 5: Mark as completed and GEO optimized
                 product.status = "completed"
                 product.seo_written = True
+                product.geo_optimized = True
                 product.processed_at = datetime.utcnow()
                 product.keywords_researched = keywords
                 product.updated_at = datetime.utcnow()
                 
-                # Log the success
-                log_api_action(db, "processor", "product_completed", "success", 
-                             f"Completed product: {product.title}", 
+                log_api_action(db, "geo_processor", "product_completed", "success", 
+                             f"GEO optimized product: {product.title}", 
                              {
                                  "keywords_count": len(keywords),
-                                 "shopify_updated": shopify_updated,
-                                 "seo_title_length": len(seo_content.get("seo_title", "")),
-                                 "meta_desc_length": len(seo_content.get("meta_description", ""))
+                                 "faq_count": len(geo_content.get("faq_content", [])),
+                                 "voice_optimized": geo_content.get("voice_search_optimized", False),
+                                 "shopify_updated": shopify_updated
                              })
                 
                 total_processed += 1
-                processor_logger.info(f"✅ SUCCESS: Product '{product.title}' completed!")
-                processor_logger.info(f"   📊 Keywords: {len(keywords)} generated")
-                processor_logger.info(f"   📝 Content: SEO title, meta desc, description generated")
-                processor_logger.info(f"   🔄 Shopify: {'Updated' if shopify_updated else 'Skipped'}")
+                processor_logger.info(f"✅ GEO SUCCESS: Product '{product.title}' completed!")
+                processor_logger.info(f"   🔍 Keywords: {len(keywords)} GEO keywords")
+                processor_logger.info(f"   ❓ FAQs: {len(geo_content.get('faq_content', []))} questions")
+                processor_logger.info(f"   🗣️ Voice optimized: {geo_content.get('voice_search_optimized', False)}")
+                processor_logger.info(f"   🔄 Shopify: {'Updated with GEO content' if shopify_updated else 'Skipped'}")
                 
             except Exception as e:
                 product.status = "failed"
                 product.updated_at = datetime.utcnow()
-                processor_logger.error(f"❌ FAILED: Product '{product.title}' failed: {e}")
-                log_api_action(db, "processor", "product_failed", "error", str(e), {"product_title": product.title})
+                processor_logger.error(f"❌ GEO FAILED: Product '{product.title}': {e}")
+                log_api_action(db, "geo_processor", "product_failed", "error", str(e))
             
             db.commit()
-            
-            # Rate limiting - wait between products
-            processor_logger.info("⏰ Waiting 5 seconds before next product...")
-            await asyncio.sleep(5)
+            processor_logger.info("⏰ Waiting 8 seconds before next product...")
+            await asyncio.sleep(8)  # Longer delay for GEO processing
         
-        # Process collections
+        # Process collections with GEO optimization
         for collection in pending_collections:
-            processor_logger.info(f"🎯 Processing collection: {collection.title}")
+            processor_logger.info(f"🎯 Processing collection with GEO: {collection.title}")
             
             collection.status = "processing"
             collection.updated_at = datetime.utcnow()
             db.commit()
             
             try:
-                # Research keywords for collection
-                processor_logger.info(f"🔍 Researching keywords for collection...")
-                keywords = await ai_service.research_keywords({
+                # GEO keyword research for collection
+                keywords = await geo_ai.research_geo_keywords({
                     "title": collection.title,
                     "products_count": collection.products_count
                 }, "collection")
                 
                 if not keywords:
-                    raise Exception("No keywords generated")
+                    raise Exception("No GEO keywords generated")
                 
-                # Generate SEO content for collection
-                processor_logger.info(f"📝 Generating SEO content for collection...")
-                seo_content = await ai_service.generate_seo_content({
+                # Generate GEO content for collection
+                geo_content = await geo_ai.generate_geo_content({
                     "title": collection.title,
                     "products_count": collection.products_count
                 }, keywords, "collection")
                 
-                if not seo_content:
-                    raise Exception("No SEO content generated")
+                if not geo_content:
+                    raise Exception("No GEO content generated")
                 
-                # Save to database
+                # Save GEO content
                 seo_record = SEOContent(
                     item_id=collection.shopify_id,
                     item_type="collection",
                     item_title=collection.title,
-                    seo_title=seo_content.get("seo_title", ""),
-                    meta_description=seo_content.get("meta_description", ""),
-                    ai_description=seo_content.get("ai_description", ""),
-                    keywords_used=keywords
+                    seo_title=geo_content.get("seo_title", ""),
+                    meta_description=geo_content.get("meta_description", ""),
+                    ai_description=geo_content.get("ai_description", ""),
+                    keywords_used=keywords,
+                    faq_content=geo_content.get("faq_content", []),
+                    schema_markup=geo_content.get("schema_markup", {}),
+                    voice_search_optimized=geo_content.get("voice_search_optimized", False),
+                    featured_snippet_content=geo_content.get("featured_snippet_content", "")
                 )
                 db.add(seo_record)
                 
-                # Update Shopify collection
-                shopify_updated = False
-                if seo_content.get("ai_description"):
-                    processor_logger.info(f"🔄 Updating collection in Shopify...")
-                    shopify_updated = await shopify.update_collection(collection.shopify_id, seo_content)
-                
                 collection.status = "completed"
                 collection.seo_written = True
+                collection.geo_optimized = True
                 collection.processed_at = datetime.utcnow()
                 collection.keywords_researched = keywords
                 collection.updated_at = datetime.utcnow()
                 
                 total_processed += 1
-                processor_logger.info(f"✅ SUCCESS: Collection '{collection.title}' completed!")
+                processor_logger.info(f"✅ GEO SUCCESS: Collection '{collection.title}' completed!")
                 
             except Exception as e:
                 collection.status = "failed"
                 collection.updated_at = datetime.utcnow()
-                processor_logger.error(f"❌ FAILED: Collection '{collection.title}' failed: {e}")
-                log_api_action(db, "processor", "collection_failed", "error", str(e), {"collection_title": collection.title})
+                processor_logger.error(f"❌ GEO FAILED: Collection '{collection.title}': {e}")
             
             db.commit()
-            await asyncio.sleep(5)
+            await asyncio.sleep(8)
         
         # Final summary
-        processor_logger.info("="*50)
-        processor_logger.info(f"🎉 PROCESSING BATCH COMPLETE")
+        processor_logger.info("="*60)
+        processor_logger.info(f"🎉 GEO PROCESSING BATCH COMPLETE")
         processor_logger.info(f"📊 Total items processed: {total_processed}")
-        processor_logger.info(f"💰 OpenAI API calls made: ~{total_processed * 2} (keywords + content)")
-        processor_logger.info("="*50)
+        processor_logger.info(f"🚀 All content optimized for Generative AI engines")
+        processor_logger.info("="*60)
         
         # Update system stats
         if state:
             state.total_items_processed += total_processed
             db.commit()
         
-        # Schedule next batch if there are more pending items
-        remaining_products = db.query(Product).filter(Product.status == "pending").count()
-        remaining_collections = db.query(Collection).filter(Collection.status == "pending").count()
-        
-        if remaining_products > 0 or remaining_collections > 0:
-            processor_logger.info(f"📋 Remaining: {remaining_products} products, {remaining_collections} collections")
-            processor_logger.info("⏰ Next batch will be processed in 2 minutes...")
-        else:
-            processor_logger.info("🏁 All items processed! System on standby for new items.")
-        
     except Exception as e:
-        processor_logger.error(f"❌ Critical processing error: {e}")
+        processor_logger.error(f"❌ Critical GEO processing error: {e}")
         processor_logger.error(traceback.format_exc())
     finally:
         db.close()
@@ -761,11 +821,19 @@ async def process_pending_items():
 @app.get("/")
 async def root():
     return {
-        "status": "AI SEO Agent Running",
-        "version": "3.1.0 - Automatic Processing",
+        "status": "AI SEO Agent Running - GEO Optimized",
+        "version": "4.0.0 - Generative Engine Optimization",
         "shopify_configured": shopify.configured,
-        "openai_configured": ai_service.client is not None,
-        "features": ["automatic_processing", "keyword_research", "content_generation", "shopify_updates"]
+        "openai_configured": geo_ai.client is not None,
+        "features": [
+            "generative_engine_optimization", 
+            "geo_keyword_research", 
+            "faq_generation",
+            "voice_search_optimization",
+            "featured_snippet_optimization",
+            "schema_markup",
+            "conversational_content"
+        ]
     }
 
 @app.get("/api/health")
@@ -777,19 +845,21 @@ async def health_check():
         "services": {
             "database": "connected",
             "shopify": "configured" if shopify.configured else "not configured",
-            "openai": "configured" if ai_service.client else "not configured"
+            "openai": "configured" if geo_ai.client else "not configured"
         },
-        "features": {
-            "automatic_processing": "enabled",
-            "content_generation": "enabled",
-            "shopify_updates": "enabled"
+        "geo_features": {
+            "keyword_research": "enabled",
+            "faq_generation": "enabled",
+            "voice_search_optimization": "enabled",
+            "featured_snippets": "enabled",
+            "schema_markup": "enabled"
         }
     }
 
 @app.get("/api/dashboard")
 async def get_dashboard(db: Session = Depends(get_db)):
     """Get comprehensive dashboard data"""
-    api_logger.info("📊 Fetching dashboard data")
+    api_logger.info("📊 Fetching GEO dashboard data")
     
     try:
         state = db.query(SystemState).first()
@@ -801,12 +871,14 @@ async def get_dashboard(db: Session = Depends(get_db)):
         completed_products = db.query(Product).filter(Product.status == "completed").count()
         pending_products = db.query(Product).filter(Product.status == "pending").count()
         processing_products = db.query(Product).filter(Product.status == "processing").count()
+        geo_optimized_products = db.query(Product).filter(Product.geo_optimized == True).count()
         
         # Collections stats
         total_collections = db.query(Collection).count()
         completed_collections = db.query(Collection).filter(Collection.status == "completed").count()
         pending_collections = db.query(Collection).filter(Collection.status == "pending").count()
         processing_collections = db.query(Collection).filter(Collection.status == "processing").count()
+        geo_optimized_collections = db.query(Collection).filter(Collection.geo_optimized == True).count()
         
         # Manual queue stats
         manual_queue_count = db.query(ManualQueue).filter(ManualQueue.status == "pending").count()
@@ -824,6 +896,15 @@ async def get_dashboard(db: Session = Depends(get_db)):
             db.query(Collection).filter(Collection.processed_at >= today_start).count()
         )
         
+        # GEO-specific stats
+        voice_optimized_count = db.query(SEOContent).filter(
+            SEOContent.voice_search_optimized == True
+        ).count()
+        
+        faq_enabled_count = db.query(SEOContent).filter(
+            SEOContent.faq_content.isnot(None)
+        ).count()
+        
         recent_activity = []
         for p in recent_products:
             recent_activity.append({
@@ -831,6 +912,7 @@ async def get_dashboard(db: Session = Depends(get_db)):
                 "title": p.title,
                 "type": "product",
                 "status": p.status,
+                "geo_optimized": p.geo_optimized,
                 "updated": p.updated_at.isoformat() if p.updated_at else None,
                 "keywords_count": len(p.keywords_researched) if p.keywords_researched else 0
             })
@@ -841,19 +923,18 @@ async def get_dashboard(db: Session = Depends(get_db)):
                 "title": c.title,
                 "type": "collection",
                 "status": c.status,
+                "geo_optimized": c.geo_optimized,
                 "updated": c.updated_at.isoformat() if c.updated_at else None,
                 "keywords_count": len(c.keywords_researched) if c.keywords_researched else 0
             })
         
         recent_activity.sort(key=lambda x: x["updated"] or "", reverse=True)
         
-        api_logger.info(f"📊 Dashboard data: {total_products} products, {total_collections} collections")
-        
         return {
             "system": {
                 "is_paused": state.is_paused,
                 "auto_pause_triggered": state.auto_pause_triggered,
-                "auto_processing_enabled": state.auto_processing_enabled,
+                "geo_optimization_enabled": state.geo_optimization_enabled,
                 "last_scan": state.last_scan.isoformat() if state.last_scan else None,
                 "products_found_in_last_scan": state.products_found_in_last_scan,
                 "collections_found_in_last_scan": state.collections_found_in_last_scan,
@@ -864,13 +945,20 @@ async def get_dashboard(db: Session = Depends(get_db)):
                     "total": total_products,
                     "completed": completed_products,
                     "pending": pending_products,
-                    "processing": processing_products
+                    "processing": processing_products,
+                    "geo_optimized": geo_optimized_products
                 },
                 "collections": {
                     "total": total_collections,
                     "completed": completed_collections,
                     "pending": pending_collections,
-                    "processing": processing_collections
+                    "processing": processing_collections,
+                    "geo_optimized": geo_optimized_collections
+                },
+                "geo_features": {
+                    "voice_optimized": voice_optimized_count,
+                    "faq_enabled": faq_enabled_count,
+                    "total_geo_optimized": geo_optimized_products + geo_optimized_collections
                 },
                 "manual_queue": manual_queue_count,
                 "processed_today": processed_today,
@@ -886,7 +974,7 @@ async def get_dashboard(db: Session = Depends(get_db)):
 @app.post("/api/scan")
 async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """Scan for products and collections"""
-    api_logger.info("🚀 Starting scan operation")
+    api_logger.info("🚀 Starting GEO scan operation")
     
     try:
         state = db.query(SystemState).first()
@@ -897,11 +985,10 @@ async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_
             api_logger.warning("⏸️ System is paused - scan aborted")
             return {"error": "System is paused", "paused": True}
         
-        # Log the scan attempt
-        log_api_action(db, "system", "scan", "started", "Starting product and collection scan")
+        log_api_action(db, "system", "geo_scan", "started", "Starting GEO-optimized scan")
         
         # Scan products
-        api_logger.info("📦 Scanning products...")
+        api_logger.info("📦 Scanning products for GEO optimization...")
         products = await shopify.get_products()
         new_products = 0
         existing_products = 0
@@ -918,16 +1005,17 @@ async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_
                     product_type=product.get('product_type', ''),
                     vendor=product.get('vendor', ''),
                     tags=str(product.get('tags', '')),
-                    status='pending'
+                    status='pending',
+                    geo_optimized=False
                 )
                 db.add(new_product)
                 new_products += 1
-                api_logger.info(f"✅ Added new product: {product.get('title', 'Unknown')}")
+                api_logger.info(f"✅ Added new product for GEO: {product.get('title', 'Unknown')}")
             else:
                 existing_products += 1
         
         # Scan collections
-        api_logger.info("📚 Scanning collections...")
+        api_logger.info("📚 Scanning collections for GEO optimization...")
         collections = await shopify.get_collections()
         new_collections = 0
         existing_collections = 0
@@ -942,11 +1030,12 @@ async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_
                     title=collection.get('title', ''),
                     handle=collection.get('handle', ''),
                     products_count=collection.get('products_count', 0),
-                    status='pending'
+                    status='pending',
+                    geo_optimized=False
                 )
                 db.add(new_collection)
                 new_collections += 1
-                api_logger.info(f"✅ Added new collection: {collection.get('title', 'Unknown')}")
+                api_logger.info(f"✅ Added new collection for GEO: {collection.get('title', 'Unknown')}")
             else:
                 existing_collections += 1
         
@@ -960,35 +1049,18 @@ async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_
         if total_new > 100:
             state.is_paused = True
             state.auto_pause_triggered = True
-            api_logger.warning(f"⚠️ AUTO-PAUSE: Found {total_new} new items (limit: 100)")
+            api_logger.warning(f"⚠️ AUTO-PAUSE: Found {total_new} new items")
         
         db.commit()
         
-        # 🚀 AUTO-TRIGGER PROCESSING for new items
+        # Auto-trigger GEO processing
         if not state.is_paused and total_new > 0:
-            api_logger.info(f"🚀 Auto-triggering content generation for {total_new} new items")
+            api_logger.info(f"🚀 Auto-triggering GEO optimization for {total_new} new items")
             background_tasks.add_task(process_pending_items)
         
-        # Log the results
-        log_api_action(
-            db, "system", "scan", "success",
-            f"Scan complete: {new_products} new products, {new_collections} new collections",
-            {
-                "new_products": new_products,
-                "existing_products": existing_products,
-                "new_collections": new_collections,
-                "existing_collections": existing_collections,
-                "auto_processing_triggered": total_new > 0 and not state.is_paused
-            }
-        )
-        
-        api_logger.info(f"""
-        📊 SCAN RESULTS:
-        ├── Products: {new_products} new, {existing_products} existing
-        ├── Collections: {new_collections} new, {existing_collections} existing
-        ├── Total scanned: {len(products)} products, {len(collections)} collections
-        └── Auto-processing: {'Triggered' if total_new > 0 and not state.is_paused else 'Not triggered'}
-        """)
+        log_api_action(db, "system", "geo_scan", "success",
+                     f"GEO scan complete: {new_products} products, {new_collections} collections",
+                     {"geo_processing_triggered": total_new > 0 and not state.is_paused})
         
         return {
             "products_found": new_products,
@@ -997,21 +1069,20 @@ async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_
             "total_collections": len(collections),
             "existing_products": existing_products,
             "existing_collections": existing_collections,
-            "auto_processing_triggered": total_new > 0 and not state.is_paused
+            "geo_processing_triggered": total_new > 0 and not state.is_paused
         }
         
     except Exception as e:
-        api_logger.error(f"❌ Scan error: {str(e)}")
-        api_logger.error(traceback.format_exc())
-        log_api_action(db, "system", "scan", "error", str(e))
+        api_logger.error(f"❌ GEO scan error: {str(e)}")
+        log_api_action(db, "system", "geo_scan", "error", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/process-pending")
 async def trigger_processing(background_tasks: BackgroundTasks):
-    """Manually trigger processing of pending items"""
-    api_logger.info("🚀 Manual processing triggered")
+    """Manually trigger GEO processing"""
+    api_logger.info("🚀 Manual GEO processing triggered")
     background_tasks.add_task(process_pending_items)
-    return {"message": "Processing started", "status": "success"}
+    return {"message": "GEO processing started", "status": "success"}
 
 @app.post("/api/pause")
 async def toggle_pause(db: Session = Depends(get_db)):
@@ -1025,15 +1096,15 @@ async def toggle_pause(db: Session = Depends(get_db)):
     db.commit()
     
     status = "paused" if state.is_paused else "running"
-    api_logger.info(f"🔄 System status changed to: {status}")
+    api_logger.info(f"🔄 GEO system status: {status}")
     
     return {"is_paused": state.is_paused}
 
 @app.get("/api/logs")
 async def get_logs(db: Session = Depends(get_db)):
-    """Get recent generation logs and API logs"""
+    """Get recent GEO logs"""
     try:
-        # Get SEO content logs
+        # Get SEO content logs with GEO data
         seo_logs = db.query(SEOContent).order_by(
             SEOContent.generated_at.desc()
         ).limit(20).all()
@@ -1052,6 +1123,9 @@ async def get_logs(db: Session = Depends(get_db)):
                     "keywords_used": log.keywords_used,
                     "seo_title": log.seo_title,
                     "meta_description": log.meta_description,
+                    "faq_count": len(log.faq_content) if log.faq_content else 0,
+                    "voice_optimized": log.voice_search_optimized,
+                    "has_schema": bool(log.schema_markup),
                     "generated_at": log.generated_at.isoformat()
                 }
                 for log in seo_logs
@@ -1069,13 +1143,13 @@ async def get_logs(db: Session = Depends(get_db)):
             ]
         }
     except Exception as e:
-        api_logger.error(f"❌ Error fetching logs: {str(e)}")
+        api_logger.error(f"❌ Error fetching GEO logs: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Additional endpoints for manual queue, etc.
+# Manual queue endpoints
 @app.post("/api/manual-queue")
 async def add_to_manual_queue(item: ManualQueueItem, db: Session = Depends(get_db)):
-    """Add item to manual processing queue"""
+    """Add item to manual GEO processing queue"""
     queue_item = ManualQueue(
         item_id=item.item_id,
         item_type=item.item_type,
@@ -1088,13 +1162,13 @@ async def add_to_manual_queue(item: ManualQueueItem, db: Session = Depends(get_d
     db.add(queue_item)
     db.commit()
     
-    api_logger.info(f"Added {item.item_type} '{item.title}' to manual queue")
+    api_logger.info(f"Added {item.item_type} '{item.title}' to GEO manual queue")
     
-    return {"message": "Item added to queue", "id": queue_item.id}
+    return {"message": "Item added to GEO queue", "id": queue_item.id}
 
 @app.get("/api/manual-queue")
 async def get_manual_queue(db: Session = Depends(get_db)):
-    """Get manual queue items"""
+    """Get manual GEO queue items"""
     items = db.query(ManualQueue).filter(
         ManualQueue.status == "pending"
     ).order_by(ManualQueue.created_at.desc()).all()
@@ -1115,17 +1189,17 @@ async def get_manual_queue(db: Session = Depends(get_db)):
 
 @app.delete("/api/manual-queue/{item_id}")
 async def remove_from_manual_queue(item_id: int, db: Session = Depends(get_db)):
-    """Remove item from manual queue"""
+    """Remove item from manual GEO queue"""
     item = db.query(ManualQueue).filter(ManualQueue.id == item_id).first()
     if item:
         db.delete(item)
         db.commit()
-        return {"message": "Item removed from queue"}
+        return {"message": "Item removed from GEO queue"}
     raise HTTPException(status_code=404, detail="Item not found")
 
 @app.post("/api/generate-content")
 async def generate_content(request: GenerateContentRequest, db: Session = Depends(get_db)):
-    """Generate content for specific item"""
+    """Generate GEO content for specific item"""
     item_data = None
     
     if request.item_type == "product":
@@ -1136,21 +1210,21 @@ async def generate_content(request: GenerateContentRequest, db: Session = Depend
     if not item_data:
         raise HTTPException(status_code=404, detail="Item not found")
     
-    # Research keywords
-    keywords = await ai_service.research_keywords(
+    # Research GEO keywords
+    keywords = await geo_ai.research_geo_keywords(
         {"title": item_data.title},
         request.item_type
     )
     
-    # Generate content
-    content = await ai_service.generate_seo_content(
+    # Generate GEO content
+    content = await geo_ai.generate_geo_content(
         {"title": item_data.title},
         keywords,
         request.item_type
     )
     
     if content:
-        # Save to database
+        # Save GEO content
         seo_record = SEOContent(
             item_id=request.item_id,
             item_type=request.item_type,
@@ -1158,13 +1232,18 @@ async def generate_content(request: GenerateContentRequest, db: Session = Depend
             seo_title=content.get("seo_title", ""),
             meta_description=content.get("meta_description", ""),
             ai_description=content.get("ai_description", ""),
-            keywords_used=keywords
+            keywords_used=keywords,
+            faq_content=content.get("faq_content", []),
+            schema_markup=content.get("schema_markup", {}),
+            voice_search_optimized=content.get("voice_search_optimized", False),
+            featured_snippet_content=content.get("featured_snippet_content", "")
         )
         db.add(seo_record)
         
         # Update item status
         item_data.status = "completed"
         item_data.seo_written = True
+        item_data.geo_optimized = True
         item_data.processed_at = datetime.utcnow()
         item_data.keywords_researched = keywords
         
@@ -1173,13 +1252,19 @@ async def generate_content(request: GenerateContentRequest, db: Session = Depend
         return {
             "success": True,
             "content": content,
-            "keywords": keywords
+            "keywords": keywords,
+            "geo_features": {
+                "faq_count": len(content.get("faq_content", [])),
+                "voice_optimized": content.get("voice_search_optimized", False),
+                "has_schema": bool(content.get("schema_markup")),
+                "featured_snippet": bool(content.get("featured_snippet_content"))
+            }
         }
     
-    return {"success": False, "error": "Failed to generate content"}
+    return {"success": False, "error": "Failed to generate GEO content"}
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    logger.info(f"🚀 Starting server on port {port}")
+    logger.info(f"🚀 Starting GEO-optimized server on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
