@@ -92,6 +92,8 @@ export default function Dashboard() {
     }
   };
 
+  const API_URL = 'https://seo-content-agent-backend-production.up.railway.app';
+
   const fetchManualQueue = async () => {
     try {
       const response = await axios.get(`${API_URL}/api/manual-queue`);
