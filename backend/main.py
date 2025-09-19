@@ -6,14 +6,13 @@ from typing import List, Dict, Optional
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text, JSON, Enum
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 from dotenv import load_dotenv
 from openai import OpenAI
 import httpx
 import logging
-import enum
 import traceback
 
 # Enhanced logging setup
@@ -48,33 +47,18 @@ for key, value in env_vars.items():
     logger.info(f"Environment: {key} = {value}")
 
 # Database setup
-# Railway's private networking often uses DATABASE_PRIVATE_URL
-DATABASE_URL = os.getenv("DATABASE_PRIVATE_URL") or os.getenv("DATABASE_URL")
-
-if DATABASE_URL:
-    # Ensure the URL format is correct for SQLAlchemy
-    if DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./seo_agent.db")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
     db_logger.info("Using PostgreSQL database")
 else:
-    # Fallback to SQLite for local development if no URL is found
-    DATABASE_URL = "sqlite:///./seo_agent.db"
-    db_logger.warning("DATABASE_URL not found, falling back to SQLite. This is not suitable for production.")
+    db_logger.info("Using SQLite database")
 
-# Enums
-class ContentType(str, enum.Enum):
-    PRODUCT = "product"
-    COLLECTION = "collection"
-    PAGE = "page"
-    BLOG = "blog"
+engine = create_engine(DATABASE_URL, echo=False)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-class ContentStatus(str, enum.Enum):
-    PENDING = "pending"
-    PROCESSING = "processing"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    SKIPPED = "skipped"
-    REVISION = "revision"
+# FIXED: Define Base BEFORE using it in model classes
+Base = declarative_base()
 
 # Database Models
 class Product(Base):
@@ -154,9 +138,9 @@ class APILog(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
-    service = Column(String)  # shopify, openai, system
+    service = Column(String)
     action = Column(String)
-    status = Column(String)  # success, error
+    status = Column(String)
     message = Column(Text)
     details = Column(JSON, nullable=True)
 
@@ -386,46 +370,6 @@ class AIService:
         except Exception as e:
             openai_logger.error(f"❌ Keyword research error: {str(e)}")
             return []
-    
-    async def generate_seo_content(self, item: dict, keywords: List[str], item_type: str = "product") -> dict:
-        """Generate SEO content for any item type"""
-        if not self.client:
-            openai_logger.error("❌ Cannot generate content - OpenAI not configured")
-            return {}
-        
-        openai_logger.info(f"📝 Generating SEO content for {item_type}: {item.get('title', 'Unknown')}")
-        
-        try:
-            prompt = f"""
-            Generate SEO content for this {item_type}:
-            Title: {item.get('title', '')}
-            Keywords: {', '.join(keywords[:5])}
-            
-            Return JSON with:
-            - seo_title (max 60 chars)
-            - meta_description (max 155 chars)
-            - ai_description (200-300 words, HTML)
-            """
-            
-            openai_logger.info(f"📤 Sending content generation request to OpenAI...")
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are an expert e-commerce SEO copywriter."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7,
-                max_tokens=1000,
-                response_format={"type": "json_object"}
-            )
-            
-            content = json.loads(response.choices[0].message.content)
-            openai_logger.info(f"✅ Successfully generated SEO content")
-            return content
-            
-        except Exception as e:
-            openai_logger.error(f"❌ Content generation error: {str(e)}")
-            return {}
 
 # Initialize services
 shopify = ShopifyService()
@@ -715,7 +659,81 @@ async def toggle_pause(db: Session = Depends(get_db)):
     
     return {"is_paused": state.is_paused}
 
-# Add other endpoints (manual queue, etc.) with similar logging...
+@app.post("/api/manual-queue")
+async def add_to_manual_queue(item: ManualQueueItem, db: Session = Depends(get_db)):
+    """Add item to manual processing queue"""
+    queue_item = ManualQueue(
+        item_id=item.item_id,
+        item_type=item.item_type,
+        title=item.title,
+        url=item.url,
+        reason=item.reason,
+        priority=15,
+        status="pending"
+    )
+    db.add(queue_item)
+    db.commit()
+    
+    api_logger.info(f"Added {item.item_type} '{item.title}' to manual queue")
+    
+    return {"message": "Item added to queue", "id": queue_item.id}
+
+@app.get("/api/manual-queue")
+async def get_manual_queue(db: Session = Depends(get_db)):
+    """Get manual queue items"""
+    items = db.query(ManualQueue).filter(
+        ManualQueue.status == "pending"
+    ).order_by(ManualQueue.created_at.desc()).all()
+    
+    return {
+        "items": [
+            {
+                "id": item.id,
+                "item_id": item.item_id,
+                "item_type": item.item_type,
+                "title": item.title,
+                "reason": item.reason,
+                "created_at": item.created_at.isoformat()
+            }
+            for item in items
+        ]
+    }
+
+@app.delete("/api/manual-queue/{item_id}")
+async def remove_from_manual_queue(item_id: int, db: Session = Depends(get_db)):
+    """Remove item from manual queue"""
+    item = db.query(ManualQueue).filter(ManualQueue.id == item_id).first()
+    if item:
+        db.delete(item)
+        db.commit()
+        return {"message": "Item removed from queue"}
+    raise HTTPException(status_code=404, detail="Item not found")
+
+@app.post("/api/generate-content")
+async def generate_content(request: GenerateContentRequest, db: Session = Depends(get_db)):
+    """Generate content for specific item"""
+    item_data = None
+    
+    if request.item_type == "product":
+        item_data = db.query(Product).filter(Product.shopify_id == request.item_id).first()
+    elif request.item_type == "collection":
+        item_data = db.query(Collection).filter(Collection.shopify_id == request.item_id).first()
+    
+    if not item_data:
+        raise HTTPException(status_code=404, detail="Item not found")
+    
+    # Research keywords
+    keywords = await ai_service.research_keywords(
+        {"title": item_data.title},
+        request.item_type
+    )
+    
+    # For now, just return the keywords (content generation can be added later)
+    return {
+        "success": True,
+        "keywords": keywords,
+        "message": "Keywords generated successfully"
+    }
 
 if __name__ == "__main__":
     import uvicorn
