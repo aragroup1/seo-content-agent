@@ -30,10 +30,8 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-    db_logger.info("Using PostgreSQL database")
 else:
     DATABASE_URL = "sqlite:///./seo_agent.db"
-    db_logger.info("Using SQLite database")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -63,9 +61,6 @@ except Exception as e:
     db_logger.error(f"❌ Database error on table creation: {e}")
 
 # --- Pydantic Models & DB Helpers ---
-class ManualQueueItem(BaseModel):
-    item_id: str; item_type: str="product"; title: str; url: Optional[str]=None; reason: str="revision"
-
 def get_db():
     db = SessionLocal();
     try: yield db
@@ -76,25 +71,22 @@ def init_system_state(db: Session):
     if not state: state=SystemState(is_paused=False); db.add(state); db.commit()
     return state
 
-# --- NEW: Data Cleaning and Sanitization Helpers ---
+# --- Data Cleaning and Sanitization Helpers ---
 def clean_input_title(title: str) -> str:
     """Removes prefixes like (M), (S), (Parcel Rate) from titles before sending to AI."""
-    # This regex removes any text in parentheses at the start of the string, followed by a space.
     cleaned_title = re.sub(r'^KATEX_INLINE_OPEN.*KATEX_INLINE_CLOSE\s*', '', title)
     return cleaned_title.strip()
 
 def sanitize_output_title(title: str) -> str:
-    """Removes special characters from AI-generated titles before sending to Shopify."""
-    # This regex keeps letters, numbers, spaces, and hyphens, and removes everything else.
-    sanitized = re.sub(r'[^a-zA-Z0-9\s-]', '', title)
+    """Removes special characters (including hyphens) from AI-generated titles."""
+    # This new, stricter regex ONLY keeps letters, numbers, and spaces.
+    sanitized = re.sub(r'[^a-zA-Z0-9\s]', '', title)
     # Replace multiple spaces with a single space
     sanitized = re.sub(r'\s+', ' ', sanitized)
     return sanitized.strip()
 
 # --- Services (Shopify & AI) ---
 class ShopifyService:
-    # ... (No changes to this class, keep the existing code from the last working version)
-    # ... For completeness, the full class is pasted below ...
     def __init__(self):
         self.shop_domain = os.getenv("SHOPIFY_SHOP_DOMAIN")
         self.access_token = os.getenv("SHOPIFY_ACCESS_TOKEN")
@@ -146,7 +138,6 @@ class CostEffectiveAIService:
         self.model = "gpt-3.5-turbo"
         if self.client: openai_logger.info(f"✅ AI Service configured - Cost-effective mode (model: {self.model})")
         else: openai_logger.warning("⚠️ OpenAI API key not configured")
-
     async def generate_seo_geo_content(self, item_title: str, item_type: str = "product") -> dict:
         if not self.client: return {}
         openai_logger.info(f"💰 Generating cost-effective content for: {item_title}")
@@ -168,44 +159,35 @@ class CostEffectiveAIService:
 async def process_pending_items(db: Session):
     processor_logger.info("="*60 + "\n🚀 STARTING AUTOMATED CONTENT GENERATION RUN\n" + "="*60)
     
-    # Process products (batch of 5)
     pending_products = db.query(Product).filter(Product.status == 'pending').limit(5).all()
     processor_logger.info(f"Found {len(pending_products)} pending products to process.")
     for product in pending_products:
+        original_title = product.title
         try:
             product.status = 'processing'; db.commit()
-            
-            # --- NEW: Clean the input title ---
-            original_title = product.title
             cleaned_title = clean_input_title(original_title)
             processor_logger.info(f"⚙️ Processing product: '{original_title}' -> CLEANED to -> '{cleaned_title}'")
-            
             content = await ai_service.generate_seo_geo_content(cleaned_title, "product")
             if not content or "title" not in content or "description" not in content: raise Exception("Content generation failed or returned invalid format")
-            
-            # --- NEW: Sanitize the output title ---
             sanitized_title = sanitize_output_title(content["title"])
             processor_logger.info(f"✨ AI title: '{content['title']}' -> SANITIZED to -> '{sanitized_title}'")
-
             success = await shopify.update_product(product.shopify_id, sanitized_title, content["description"])
             if not success: raise Exception("Shopify API update failed")
-            
             product.status = 'completed'; product.seo_written = True; product.processed_at = datetime.utcnow()
             seo_record = SEOContent(item_id=product.shopify_id, item_type='product', item_title=sanitized_title, seo_title=sanitized_title, ai_description=content["description"])
             db.add(seo_record)
             processor_logger.info(f"✅ Successfully processed product: {sanitized_title}")
         except Exception as e:
             product.status = 'failed'
-            processor_logger.error(f"❌ Failed to process product {original_title}: {e}"); traceback.print_exc()
+            processor_logger.error(f"❌ Failed to process product '{original_title}': {e}"); traceback.print_exc()
         finally: db.commit(); await asyncio.sleep(3)
 
-    # Process collections (batch of 2)
     pending_collections = db.query(Collection).filter(Collection.status == 'pending').limit(2).all()
     processor_logger.info(f"Found {len(pending_collections)} pending collections to process.")
     for collection in pending_collections:
+        original_title = collection.title
         try:
             collection.status = 'processing'; db.commit()
-            original_title = collection.title
             cleaned_title = clean_input_title(original_title)
             processor_logger.info(f"⚙️ Processing collection: '{original_title}' -> CLEANED to -> '{cleaned_title}'")
             content = await ai_service.generate_seo_geo_content(cleaned_title, "collection")
@@ -220,7 +202,7 @@ async def process_pending_items(db: Session):
             processor_logger.info(f"✅ Successfully processed collection: {sanitized_title}")
         except Exception as e:
             collection.status = 'failed'
-            processor_logger.error(f"❌ Failed to process collection {original_title}: {e}"); traceback.print_exc()
+            processor_logger.error(f"❌ Failed to process collection '{original_title}': {e}"); traceback.print_exc()
         finally: db.commit(); await asyncio.sleep(3)
     processor_logger.info("🏁 Background processing run finished.")
 
@@ -238,7 +220,6 @@ async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_
     state = db.query(SystemState).first();
     if not state: state = init_system_state(db)
     if state.is_paused: return {"error": "System is paused"}
-    # Logic to only add NEW products
     products = await shopify.get_products(); new_products = 0
     for p in products:
         if not db.query(Product).filter(Product.shopify_id == str(p.get('id'))).first():
@@ -250,7 +231,6 @@ async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_
     state.last_scan=datetime.utcnow(); state.products_found_in_last_scan=new_products; state.collections_found_in_last_scan=new_collections
     if (new_products+new_collections)>100: state.is_paused=True; state.auto_pause_triggered=True
     db.commit()
-    # Auto-process if not paused
     if not state.is_paused and (new_products > 0 or new_collections > 0):
         background_tasks.add_task(process_pending_items, db)
     return {"products_found":new_products, "collections_found":new_collections}
@@ -274,11 +254,7 @@ async def get_dashboard(db: Session = Depends(get_db)):
     recent_activity.sort(key=lambda x: x["updated"] or "", reverse=True)
     return {
         "system": {"is_paused": state.is_paused, "auto_pause_triggered": state.auto_pause_triggered, "last_scan": state.last_scan.isoformat() if state.last_scan else None},
-        "stats": {
-            "products": {"total": total_products, "completed": completed_products, "pending": pending_products},
-            "collections": {"total": total_collections, "completed": completed_collections, "pending": pending_collections},
-            "total_completed": completed_products + completed_collections
-        },
+        "stats": { "products": {"total": total_products, "completed": completed_products, "pending": pending_products}, "collections": {"total": total_collections, "completed": completed_collections, "pending": pending_collections}, "total_completed": completed_products + completed_collections },
         "recent_activity": recent_activity[:10]
     }
 
@@ -288,8 +264,3 @@ async def toggle_pause(db: Session = Depends(get_db)):
     if not state: state = init_system_state(db)
     state.is_paused = not state.is_paused; state.auto_pause_triggered = False; db.commit()
     return {"is_paused": state.is_paused}
-
-@app.get("/api/logs")
-async def get_logs(db: Session = Depends(get_db)):
-    logs = db.query(SEOContent).order_by(SEOContent.generated_at.desc()).limit(50).all()
-    return {"logs": [{'item_id': log.item_id, 'item_type': log.item_type, 'item_title': log.item_title, 'generated_at': log.generated_at.isoformat()} for log in logs]}
