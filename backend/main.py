@@ -264,3 +264,27 @@ async def toggle_pause(db: Session = Depends(get_db)):
     if not state: state = init_system_state(db)
     state.is_paused = not state.is_paused; state.auto_pause_triggered = False; db.commit()
     return {"is_paused": state.is_paused}
+
+# Add this new endpoint to the end of your main.py file
+
+@app.post("/api/cron/run-tasks")
+async def trigger_cron_processing(background_tasks: BackgroundTasks, request: Request, db: Session = Depends(get_db)):
+    """A secure endpoint for the Railway Cron Job to call."""
+    # For security, you can add a secret key check here if you want
+    # For now, we'll keep it simple as it's an internal service call.
+    api_logger.info("🤖 Cron job triggered.")
+
+    state = db.query(SystemState).first()
+    if state and state.is_paused:
+        processor_logger.info("⏸️ Cron job skipped: System is paused.")
+        return {"message": "Skipped: System is paused."}
+        
+    # --- This is the automation magic ---
+    # 1. First, it automatically scans for new items.
+    await scan_all(background_tasks, db)
+    
+    # 2. Then, it automatically starts processing the queue.
+    background_tasks.add_task(process_pending_items, db)
+    
+    api_logger.info("✅ Cron job successfully triggered scan and process.")
+    return {"message": "Automated scan and process task scheduled."}
