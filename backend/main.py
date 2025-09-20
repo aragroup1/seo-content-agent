@@ -236,4 +236,4 @@ async def toggle_pause(db: Session = Depends(get_db)):
     state = db.query(SystemState).first();
     if not state: state = init_system_state(db)
     state.is_paused = not state.is_paused; state.auto_pause_triggered = False; db.commit()
-    return {"is_paused": state.is_paused}
+    return {"is_paused": state.is_paused} 
