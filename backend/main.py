@@ -4,7 +4,7 @@ import asyncio
 import re
 from datetime import datetime
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text, JSON
@@ -86,19 +86,19 @@ class ShopifyService:
         if not self.configured: return None
         url = f"{self.base_url}/products/{product_id}.json"
         async with httpx.AsyncClient() as c:
-            try: resp = await c.get(url, headers=self.headers, params={"fields":"id,body_html"}, timeout=20); resp.raise_for_status(); return resp.json().get("product")
+            try: resp = await c.get(url, headers=self.headers, params={"fields":"id,title,body_html,product_type,vendor"}, timeout=20); resp.raise_for_status(); return resp.json().get("product")
             except Exception as e: shopify_logger.error(f"Failed to get details for product {product_id}: {e}"); return None
     async def get_products(self, limit=250):
         if not self.configured: return []
         async with httpx.AsyncClient() as c:
-            try: resp = await c.get(f"{self.base_url}/products.json", headers=self.headers, params={"limit": limit,"fields":"id,title,handle,product_type,vendor,tags"}, timeout=30); resp.raise_for_status(); return resp.json().get("products", [])
+            try: resp = await c.get(f"{self.base_url}/products.json", headers=self.headers, params={"limit": limit,"fields":"id,title"}, timeout=30); resp.raise_for_status(); return resp.json().get("products", [])
             except Exception as e: shopify_logger.error(f"Failed to get products: {e}"); return []
     async def get_collections(self, limit=250):
         if not self.configured: return []
         async with httpx.AsyncClient() as c:
             try:
-                smart = await c.get(f"{self.base_url}/smart_collections.json", headers=self.headers, params={"limit": limit,"fields":"id,title,handle,products_count"}, timeout=30)
-                custom = await c.get(f"{self.base_url}/custom_collections.json", headers=self.headers, params={"limit": limit,"fields":"id,title,handle,products_count"}, timeout=30)
+                smart = await c.get(f"{self.base_url}/smart_collections.json", headers=self.headers, params={"limit": limit,"fields":"id,title,products_count"}, timeout=30)
+                custom = await c.get(f"{self.base_url}/custom_collections.json", headers=self.headers, params={"limit": limit,"fields":"id,title,products_count"}, timeout=30)
                 collections = []
                 if smart.status_code == 200: collections.extend(smart.json().get("smart_collections", []))
                 if custom.status_code == 200: collections.extend(custom.json().get("custom_collections", []))
@@ -122,16 +122,16 @@ class SmartAIService:
     def __init__(self):
         self.api_key = os.getenv("OPENAI_API_KEY"); self.client = OpenAI(api_key=self.api_key) if self.api_key else None; self.model = "gpt-3.5-turbo"
         if self.client: openai_logger.info(f"✅ AI Service configured - Smart Mode (model: {self.model})")
-    async def generate_full_content(self, title: str) -> dict:
+    async def generate_full_content(self, title: str, existing_description: str) -> dict:
         if not self.client: return {}
-        prompt = f'Create SEO content for this product: "{title}". Generate: 1. A new `title` that is descriptive and aims for the SEO-safe maximum of 60-70 characters. 2. A new `description` in HTML (1-2 paragraphs, 100-150 words). Format as a valid JSON object with "title" and "description" keys.'
+        prompt = f'Act as an expert SEO copy editor. Rewrite and expand the following content for the product "{title}". Use the existing description for context, but create a better, more complete version. Generate: 1. A new `title` (max 60 characters). 2. A new `description` in HTML (1-2 paragraphs, 100-150 words). Format as a valid JSON with "title" and "description" keys. Existing Description: "{existing_description}"'
         try:
-            resp = await asyncio.to_thread(self.client.chat.completions.create, model=self.model, messages=[{"role": "system", "content": "You are a concise and professional SEO copywriter."}, {"role": "user", "content": prompt}], temperature=0.7, max_tokens=400, response_format={"type": "json_object"})
+            resp = await asyncio.to_thread(self.client.chat.completions.create, model=self.model, messages=[{"role": "system", "content": "You are a concise and professional SEO copywriter who improves existing text."}, {"role": "user", "content": prompt}], temperature=0.7, max_tokens=400, response_format={"type": "json_object"})
             return json.loads(resp.choices[0].message.content)
         except Exception as e: openai_logger.error(f"AI full content error for '{title}': {e}"); return {}
     async def generate_meta_only_content(self, title: str, existing_description: str) -> dict:
         if not self.client: return {}
-        prompt = f'Based on the product title "{title}" and this existing description: "{existing_description[:1000]}...", create: 1. A new main `title` for the product page (highly descriptive, 60-70 characters). 2. A new SEO `meta_title` for search engines (also 60-70 characters). 3. A compelling `meta_description` (max 155 chars). Format as a valid JSON object with "title", "meta_title", and "meta_description" keys.'
+        prompt = f'Based on the product title "{title}" and this existing description: "{existing_description[:1000]}...", create: 1. A new main `title` for the product page (descriptive, 60-70 characters). 2. A new SEO `meta_title` for search engines (60-70 characters). 3. A compelling `meta_description` (max 155 chars). Format as a valid JSON object with "title", "meta_title", and "meta_description" keys.'
         try:
             resp = await asyncio.to_thread(self.client.chat.completions.create, model=self.model, messages=[{"role": "system", "content": "You are an expert SEO copywriter creating metadata."}, {"role": "user", "content": prompt}], temperature=0.7, max_tokens=300, response_format={"type": "json_object"})
             return json.loads(resp.choices[0].message.content)
@@ -165,7 +165,7 @@ async def process_pending_items(db: Session):
                 if not success: raise Exception("Shopify API update failed.")
             else:
                 processor_logger.info(f"✍️ Full Rewrite Mode for '{cleaned_title}' (Word count: {word_count})")
-                content = await ai_service.generate_full_content(cleaned_title)
+                content = await ai_service.generate_full_content(cleaned_title, existing_description_text)
                 if not content or "title" not in content or "description" not in content: raise Exception("Full Rewrite content generation failed.")
                 sanitized_title = sanitize_output_title(content["title"])
                 success = await shopify.update_product(product_stub.shopify_id, title=sanitized_title, description=content["description"])
@@ -180,7 +180,7 @@ async def process_pending_items(db: Session):
     processor_logger.info("🏁 Background processing run finished.")
 
 # --- FastAPI App & Endpoints ---
-app = FastAPI(title="AI SEO Content Agent", version="SMART-FINAL-V2")
+app = FastAPI(title="AI SEO Content Agent", version="SMART-FINAL-V3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 shopify = ShopifyService()
 ai_service = SmartAIService()
