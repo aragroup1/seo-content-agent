@@ -4,7 +4,7 @@ import asyncio
 import re
 from datetime import datetime
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request # <-- FIX IS HERE
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text, JSON
@@ -73,25 +73,14 @@ def init_system_state(db: Session):
 
 # --- Data Cleaning and Sanitization Helpers ---
 def clean_input_title(title: str) -> str:
-    """Removes prefixes like (M), (S), (Parcel Rate) from titles before sending to AI."""
-    cleaned_title = re.sub(r'^KATEX_INLINE_OPEN.*KATEX_INLINE_CLOSE\s*', '', title)
-    return cleaned_title.strip()
-
+    cleaned_title = re.sub(r'^KATEX_INLINE_OPEN.*KATEX_INLINE_CLOSE\s*', '', title); return cleaned_title.strip()
 def sanitize_output_title(title: str) -> str:
-    """Removes special characters (including hyphens) from AI-generated titles."""
-    # This new, stricter regex ONLY keeps letters, numbers, and spaces.
-    sanitized = re.sub(r'[^a-zA-Z0-9\s]', '', title)
-    # Replace multiple spaces with a single space
-    sanitized = re.sub(r'\s+', ' ', sanitized)
-    return sanitized.strip()
+    sanitized = re.sub(r'[^a-zA-Z0-9\s]', '', title); sanitized = re.sub(r'\s+', ' ', sanitized); return sanitized.strip()
 
 # --- Services (Shopify & AI) ---
 class ShopifyService:
     def __init__(self):
-        self.shop_domain = os.getenv("SHOPIFY_SHOP_DOMAIN")
-        self.access_token = os.getenv("SHOPIFY_ACCESS_TOKEN")
-        self.api_version = "2024-01"
-        self.configured = bool(self.shop_domain and self.access_token)
+        self.shop_domain = os.getenv("SHOPIFY_SHOP_DOMAIN"); self.access_token = os.getenv("SHOPIFY_ACCESS_TOKEN"); self.api_version = "2024-01"; self.configured = bool(self.shop_domain and self.access_token)
         if self.configured: self.base_url = f"https://{self.shop_domain}/admin/api/{self.api_version}"; self.headers = {"X-Shopify-Access-Token": self.access_token, "Content-Type": "application/json"}
         else: shopify_logger.warning("⚠️ Shopify credentials not configured")
     async def get_products(self, limit=250):
@@ -105,7 +94,7 @@ class ShopifyService:
             try:
                 smart = await c.get(f"{self.base_url}/smart_collections.json", headers=self.headers, params={"limit": limit,"fields":"id,title,handle,products_count"}, timeout=30)
                 custom = await c.get(f"{self.base_url}/custom_collections.json", headers=self.headers, params={"limit": limit,"fields":"id,title,handle,products_count"}, timeout=30)
-                collections = []
+                collections = [];
                 if smart.status_code == 200: collections.extend(smart.json().get("smart_collections", []))
                 if custom.status_code == 200: collections.extend(custom.json().get("custom_collections", []))
                 return collections
@@ -133,32 +122,21 @@ class ShopifyService:
 
 class CostEffectiveAIService:
     def __init__(self):
-        self.api_key = os.getenv("OPENAI_API_KEY")
-        self.client = OpenAI(api_key=self.api_key) if self.api_key else None
-        self.model = "gpt-3.5-turbo"
+        self.api_key = os.getenv("OPENAI_API_KEY"); self.client = OpenAI(api_key=self.api_key) if self.api_key else None; self.model = "gpt-3.5-turbo"
         if self.client: openai_logger.info(f"✅ AI Service configured - Cost-effective mode (model: {self.model})")
         else: openai_logger.warning("⚠️ OpenAI API key not configured")
     async def generate_seo_geo_content(self, item_title: str, item_type: str = "product") -> dict:
         if not self.client: return {}
         openai_logger.info(f"💰 Generating cost-effective content for: {item_title}")
-        prompt = f"""
-        Create SEO and AI-search optimized content for this e-commerce {item_type}: "{item_title}".
-        Generate:
-        1. A new `title` for the Shopify page. Max 60 characters. It must be compelling and clean of special characters.
-        2. A new `description` in HTML format. It must be **no more than 2 short paragraphs** (100-150 words total). The first paragraph explains what it is and its main benefit. The second paragraph explains why to choose it.
-        Format the response as a single, valid JSON object with two keys: "title" and "description".
-        """
+        prompt = f'Create SEO and AI-search optimized content for this e-commerce {item_type}: "{item_title}". Generate: 1. A new `title` for the Shopify page. Max 60 characters. It must be compelling and clean of special characters. 2. A new `description` in HTML format. It must be **no more than 2 short paragraphs** (100-150 words total). The first paragraph explains what it is and its main benefit. The second paragraph explains why to choose it. Format the response as a single, valid JSON object with two keys: "title" and "description".'
         try:
             resp = await asyncio.to_thread(self.client.chat.completions.create, model=self.model, messages=[{"role": "system", "content": "You are an expert SEO copywriter. Be concise, professional, and cost-effective."}, {"role": "user", "content": prompt}], temperature=0.7, max_tokens=400, response_format={"type": "json_object"})
-            content = json.loads(resp.choices[0].message.content)
-            openai_logger.info(f"✅ Generated raw content for {item_title}")
-            return content
+            content = json.loads(resp.choices[0].message.content); openai_logger.info(f"✅ Generated raw content for {item_title}"); return content
         except Exception as e: openai_logger.error(f"❌ AI generation error for {item_title}: {e}"); return {}
 
 # --- Background Processing Logic ---
 async def process_pending_items(db: Session):
     processor_logger.info("="*60 + "\n🚀 STARTING AUTOMATED CONTENT GENERATION RUN\n" + "="*60)
-    
     pending_products = db.query(Product).filter(Product.status == 'pending').limit(5).all()
     processor_logger.info(f"Found {len(pending_products)} pending products to process.")
     for product in pending_products:
@@ -175,11 +153,9 @@ async def process_pending_items(db: Session):
             if not success: raise Exception("Shopify API update failed")
             product.status = 'completed'; product.seo_written = True; product.processed_at = datetime.utcnow()
             seo_record = SEOContent(item_id=product.shopify_id, item_type='product', item_title=sanitized_title, seo_title=sanitized_title, ai_description=content["description"])
-            db.add(seo_record)
-            processor_logger.info(f"✅ Successfully processed product: {sanitized_title}")
+            db.add(seo_record); processor_logger.info(f"✅ Successfully processed product: {sanitized_title}")
         except Exception as e:
-            product.status = 'failed'
-            processor_logger.error(f"❌ Failed to process product '{original_title}': {e}"); traceback.print_exc()
+            product.status = 'failed'; processor_logger.error(f"❌ Failed to process product '{original_title}': {e}"); traceback.print_exc()
         finally: db.commit(); await asyncio.sleep(3)
 
     pending_collections = db.query(Collection).filter(Collection.status == 'pending').limit(2).all()
@@ -198,11 +174,9 @@ async def process_pending_items(db: Session):
             if not success: raise Exception("Shopify API update failed")
             collection.status = 'completed'; collection.seo_written = True; collection.processed_at = datetime.utcnow()
             seo_record = SEOContent(item_id=collection.shopify_id, item_type='collection', item_title=sanitized_title, seo_title=sanitized_title, ai_description=content["description"])
-            db.add(seo_record)
-            processor_logger.info(f"✅ Successfully processed collection: {sanitized_title}")
+            db.add(seo_record); processor_logger.info(f"✅ Successfully processed collection: {sanitized_title}")
         except Exception as e:
-            collection.status = 'failed'
-            processor_logger.error(f"❌ Failed to process collection '{original_title}': {e}"); traceback.print_exc()
+            collection.status = 'failed'; processor_logger.error(f"❌ Failed to process collection '{original_title}': {e}"); traceback.print_exc()
         finally: db.commit(); await asyncio.sleep(3)
     processor_logger.info("🏁 Background processing run finished.")
 
@@ -265,26 +239,14 @@ async def toggle_pause(db: Session = Depends(get_db)):
     state.is_paused = not state.is_paused; state.auto_pause_triggered = False; db.commit()
     return {"is_paused": state.is_paused}
 
-# Add this new endpoint to the end of your main.py file
-
 @app.post("/api/cron/run-tasks")
 async def trigger_cron_processing(background_tasks: BackgroundTasks, request: Request, db: Session = Depends(get_db)):
-    """A secure endpoint for the Railway Cron Job to call."""
-    # For security, you can add a secret key check here if you want
-    # For now, we'll keep it simple as it's an internal service call.
-    api_logger.info("🤖 Cron job triggered.")
-
+    api_logger.info("🤖 Cron job triggered by Railway scheduler.")
     state = db.query(SystemState).first()
-    if state and state.is_paused:
-        processor_logger.info("⏸️ Cron job skipped: System is paused.")
+    if not state: state = init_system_state(db)
+    if state.is_paused:
+        processor_logger.info("⏸️ Cron job skipped: System is currently paused.")
         return {"message": "Skipped: System is paused."}
-        
-    # --- This is the automation magic ---
-    # 1. First, it automatically scans for new items.
+    api_logger.info("🤖 Cron: Kicking off automatic scan and process.")
     await scan_all(background_tasks, db)
-    
-    # 2. Then, it automatically starts processing the queue.
-    background_tasks.add_task(process_pending_items, db)
-    
-    api_logger.info("✅ Cron job successfully triggered scan and process.")
     return {"message": "Automated scan and process task scheduled."}
