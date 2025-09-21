@@ -4,7 +4,7 @@ import asyncio
 import re
 from datetime import datetime
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text, JSON
@@ -69,26 +69,16 @@ def init_system_state(db: Session):
     state = db.query(SystemState).first()
     if not state: state=SystemState(is_paused=False); db.add(state); db.commit()
     return state
-
 def clean_input_text(text: str) -> str:
-    """Removes prefixes and common shipping-related phrases from text."""
     if not text: return ""
-    # Remove prefixes like (M), (S), etc.
     cleaned = re.sub(r'^KATEX_INLINE_OPEN.*KATEX_INLINE_CLOSE\s*', '', text)
-    # Remove shipping rate phrases, case-insensitively
-    shipping_phrases = [
-        "Large Letter Rate", "Big Parcel Rate", "Small Parcel Rate", "Parcel Rate"
-    ]
-    # This regex handles the phrases possibly being inside parentheses
+    shipping_phrases = ["Large Letter Rate", "Big Parcel Rate", "Small Parcel Rate", "Parcel Rate"]
     pattern = r'\s*KATEX_INLINE_OPEN(?:' + '|'.join(shipping_phrases) + r')KATEX_INLINE_CLOSE\s*|\s*(?:' + '|'.join(shipping_phrases) + r')\s*'
     cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
-
 def sanitize_output_title(title: str) -> str:
-    """Removes special characters from AI-generated titles."""
     sanitized = re.sub(r'[^a-zA-Z0-9\s]', '', title)
     return re.sub(r'\s+', ' ', sanitized).strip()
-
 def html_to_text(html_content: str) -> str:
     if not html_content: return ""
     return re.sub('<[^<]+?>', ' ', html_content).strip()
@@ -96,182 +86,177 @@ def html_to_text(html_content: str) -> str:
 # --- Services (Shopify & AI) ---
 class ShopifyService:
     def __init__(self):
-        self.shop_domain = os.getenv("SHOPIFY_SHOP_DOMAIN"); self.access_token = os.getenv("SHOPIFY_ACCESS_TOKEN"); self.api_version = "2024-01"; self.configured = bool(self.shop_domain and self.access_token)
-        if self.configured: self.base_url = f"https://{self.shop_domain}/admin/api/{self.api_version}"; self.headers = {"X-Shopify-Access-Token": self.access_token, "Content-Type": "application/json"}
+        self.shop_domain=os.getenv("SHOPIFY_SHOP_DOMAIN"); self.access_token=os.getenv("SHOPIFY_ACCESS_TOKEN"); self.api_version="2024-01"; self.configured=bool(self.shop_domain and self.access_token)
+        if self.configured: self.base_url=f"https://{self.shop_domain}/admin/api/{self.api_version}"; self.headers={"X-Shopify-Access-Token": self.access_token, "Content-Type": "application/json"}
     async def get_product_details(self, product_id: str):
         if not self.configured: return None
-        url = f"{self.base_url}/products/{product_id}.json"
+        url=f"{self.base_url}/products/{product_id}.json"
         async with httpx.AsyncClient() as c:
-            try: resp = await c.get(url, headers=self.headers, params={"fields":"id,title,body_html,product_type,vendor"}, timeout=20); resp.raise_for_status(); return resp.json().get("product")
+            try: resp=await c.get(url,headers=self.headers,params={"fields":"id,title,body_html,product_type,vendor"},timeout=20); resp.raise_for_status(); return resp.json().get("product")
             except Exception as e: shopify_logger.error(f"Failed to get details for product {product_id}: {e}"); return None
     async def get_products(self, limit=250):
         if not self.configured: return []
         async with httpx.AsyncClient() as c:
-            try: resp = await c.get(f"{self.base_url}/products.json", headers=self.headers, params={"limit": limit,"fields":"id,title,handle"}, timeout=30); resp.raise_for_status(); return resp.json().get("products", [])
-            except Exception as e: shopify_logger.error(f"Failed to get products: {e}"); return []
+            try: resp=await c.get(f"{self.base_url}/products.json",headers=self.headers,params={"limit":limit,"fields":"id,title"},timeout=30); resp.raise_for_status(); return resp.json().get("products",[])
+            except Exception as e: shopify_logger.error(f"Failed to get products: {e}"); return[]
     async def get_collections(self, limit=250):
-        if not self.configured: return []
+        if not self.configured: return[]
         async with httpx.AsyncClient() as c:
             try:
-                smart = await c.get(f"{self.base_url}/smart_collections.json", headers=self.headers, params={"limit": limit,"fields":"id,title,handle,products_count"}, timeout=30)
-                custom = await c.get(f"{self.base_url}/custom_collections.json", headers=self.headers, params={"limit": limit,"fields":"id,title,handle,products_count"}, timeout=30)
-                collections = []
-                if smart.status_code == 200: collections.extend(smart.json().get("smart_collections", []))
-                if custom.status_code == 200: collections.extend(custom.json().get("custom_collections", []))
+                smart=await c.get(f"{self.base_url}/smart_collections.json",headers=self.headers,params={"limit":limit,"fields":"id,title,products_count"},timeout=30)
+                custom=await c.get(f"{self.base_url}/custom_collections.json",headers=self.headers,params={"limit":limit,"fields":"id,title,products_count"},timeout=30)
+                collections=[];
+                if smart.status_code==200: collections.extend(smart.json().get("smart_collections",[]))
+                if custom.status_code==200: collections.extend(custom.json().get("custom_collections",[]))
                 return collections
-            except Exception as e: shopify_logger.error(f"Failed to get collections: {e}"); return []
-    async def update_product(self, product_id: str, title: Optional[str] = None, description: Optional[str] = None, meta_title: Optional[str] = None, meta_description: Optional[str] = None):
+            except Exception as e: shopify_logger.error(f"Failed to get collections: {e}"); return[]
+    async def update_product(self, product_id: str, title: Optional[str]=None, description: Optional[str]=None, meta_title: Optional[str]=None, meta_description: Optional[str]=None):
         if not self.configured: return False
-        payload = {"product": {"id": int(product_id)}}
-        metafields = []
-        if title: payload["product"]["title"] = title
-        if description: payload["product"]["body_html"] = description
-        if meta_title: metafields.append({"key": "title_tag", "namespace": "global", "value": meta_title, "type": "string"})
-        if meta_description: metafields.append({"key": "description_tag", "namespace": "global", "value": meta_description, "type": "string"})
-        if metafields: payload["product"]["metafields"] = metafields
-        url = f"{self.base_url}/products/{product_id}.json"
+        payload={"product":{"id":int(product_id)}}; metafields=[]
+        if title: payload["product"]["title"]=title
+        if description: payload["product"]["body_html"]=description
+        if meta_title: metafields.append({"key":"title_tag","namespace":"global","value":meta_title,"type":"string"})
+        if meta_description: metafields.append({"key":"description_tag","namespace":"global","value":meta_description,"type":"string"})
+        if metafields: payload["product"]["metafields"]=metafields
+        url=f"{self.base_url}/products/{product_id}.json"
         async with httpx.AsyncClient() as c:
-            try: resp = await c.put(url, headers=self.headers, json=payload, timeout=30); resp.raise_for_status(); shopify_logger.info(f"✅ Shopify update successful for product {product_id}."); return True
+            try: resp=await c.put(url,headers=self.headers,json=payload,timeout=30); resp.raise_for_status(); shopify_logger.info(f"✅ Shopify update successful for product {product_id}."); return True
             except Exception as e: shopify_logger.error(f"❌ Shopify update failed for product {product_id}: {e}"); return False
 
 class SmartAIService:
     def __init__(self):
-        self.api_key = os.getenv("OPENAI_API_KEY"); self.client = OpenAI(api_key=self.api_key) if self.api_key else None; self.model = "gpt-3.5-turbo"
+        self.api_key=os.getenv("OPENAI_API_KEY"); self.client=OpenAI(api_key=self.api_key) if self.api_key else None; self.model="gpt-3.5-turbo"
         if self.client: openai_logger.info(f"✅ AI Service configured - Smart Mode (model: {self.model})")
     async def generate_full_content(self, title: str, existing_description: str) -> dict:
-        if not self.client: return {}
-        prompt = f'Act as an expert SEO copy editor. Rewrite and expand the following content for the product "{title}". Use the existing description for context, but create a better, more complete version. Generate: 1. A new `title` (max 60 characters). 2. A new `description` in HTML (1-2 paragraphs, 100-150 words). Format as a valid JSON with "title" and "description" keys. Existing Description: "{existing_description}"'
+        if not self.client: return{}
+        prompt=f'Act as an expert SEO copy editor. Rewrite and expand the following content for the product "{title}". Use the existing description for context, but create a better, more complete version. Generate: 1. A new `title` (max 60 characters). 2. A new `description` in HTML (1-2 paragraphs, 100-150 words). Format as a valid JSON with "title" and "description" keys. Existing Description: "{existing_description}"'
         try:
-            resp = await asyncio.to_thread(self.client.chat.completions.create, model=self.model, messages=[{"role": "system", "content": "You are a concise and professional SEO copywriter who improves existing text."}, {"role": "user", "content": prompt}], temperature=0.7, max_tokens=400, response_format={"type": "json_object"})
+            resp=await asyncio.to_thread(self.client.chat.completions.create,model=self.model,messages=[{"role":"system","content":"You are a concise and professional SEO copywriter who improves existing text."},{"role":"user","content":prompt}],temperature=0.7,max_tokens=400,response_format={"type":"json_object"})
             return json.loads(resp.choices[0].message.content)
-        except Exception as e: openai_logger.error(f"AI full content error for '{title}': {e}"); return {}
+        except Exception as e: openai_logger.error(f"AI full content error for '{title}': {e}"); return{}
     async def generate_meta_only_content(self, title: str, existing_description: str) -> dict:
-        if not self.client: return {}
-        prompt = f'Based on the product title "{title}" and this existing description: "{existing_description[:1000]}...", create: 1. A new main `title` for the product page (descriptive, 60-70 characters). 2. A new SEO `meta_title` for search engines (60-70 characters). 3. A compelling `meta_description` (max 155 chars). Format as a valid JSON object with "title", "meta_title", and "meta_description" keys.'
+        if not self.client: return{}
+        prompt=f'Based on the product title "{title}" and this existing description: "{existing_description[:1000]}...", create: 1. A new main `title` for the product page (descriptive, 60-70 characters). 2. A new SEO `meta_title` for search engines (60-70 characters). 3. A compelling `meta_description` (max 155 chars). Format as a valid JSON object with "title", "meta_title", and "meta_description" keys.'
         try:
-            resp = await asyncio.to_thread(self.client.chat.completions.create, model=self.model, messages=[{"role": "system", "content": "You are an expert SEO copywriter creating metadata."}, {"role": "user", "content": prompt}], temperature=0.7, max_tokens=300, response_format={"type": "json_object"})
+            resp=await asyncio.to_thread(self.client.chat.completions.create,model=self.model,messages=[{"role":"system","content":"You are an expert SEO copywriter creating metadata."},{"role":"user","content":prompt}],temperature=0.7,max_tokens=300,response_format={"type":"json_object"})
             return json.loads(resp.choices[0].message.content)
-        except Exception as e: openai_logger.error(f"AI meta only error for '{title}': {e}"); return {}
+        except Exception as e: openai_logger.error(f"AI meta only error for '{title}': {e}"); return{}
 
 # --- Background Processing Logic ---
 async def process_pending_items(db: Session):
-    processor_logger.info("="*60 + "\n🚀 STARTING SMART CONTENT OPTIMIZATION RUN\n" + "="*60)
-    WORD_COUNT_THRESHOLD = int(os.getenv("DESCRIPTION_WORD_COUNT_THRESHOLD", 100))
+    processor_logger.info("="*60+"\n🚀 STARTING SMART CONTENT OPTIMIZATION RUN\n"+"="*60)
+    WORD_COUNT_THRESHOLD=int(os.getenv("DESCRIPTION_WORD_COUNT_THRESHOLD",100))
     processor_logger.info(f"Smart Mode Active: Word count threshold is {WORD_COUNT_THRESHOLD} words.")
-    
-    pending_products = db.query(Product).filter(Product.status == 'pending').limit(5).all()
+    pending_products=db.query(Product).filter(Product.status=='pending').limit(5).all()
     processor_logger.info(f"Found {len(pending_products)} pending products to process.")
     for product_stub in pending_products:
-        original_title = product_stub.title
+        original_title=product_stub.title
         try:
-            product_stub.status = 'processing'; db.commit()
-            
-            full_product = await shopify.get_product_details(product_stub.shopify_id)
+            product_stub.status='processing'; db.commit()
+            full_product=await shopify.get_product_details(product_stub.shopify_id)
             if not full_product: raise Exception("Could not fetch full product details from Shopify.")
-                
-            existing_description_html = full_product.get('body_html', '')
-            
-            # --- NEW: Clean both title and description before processing ---
-            cleaned_title = clean_input_text(original_title)
-            cleaned_description_text = clean_input_text(html_to_text(existing_description_html))
-            
-            word_count = len(cleaned_description_text.split())
-            
+            existing_description_html=full_product.get('body_html','')
+            cleaned_title=clean_input_text(original_title)
+            cleaned_description_text=clean_input_text(html_to_text(existing_description_html))
+            word_count=len(cleaned_description_text.split())
             processor_logger.info(f"⚙️ Processing product: '{original_title}' -> CLEANED to -> '{cleaned_title}'")
-            
-            # --- SMART MODE DECISION ---
-            if word_count >= WORD_COUNT_THRESHOLD:
-                # META ONLY MODE
+            if word_count>=WORD_COUNT_THRESHOLD:
                 processor_logger.info(f"🎯 Meta Only Mode for '{cleaned_title}' (Word count: {word_count})")
-                content = await ai_service.generate_meta_only_content(cleaned_title, cleaned_description_text)
-                if not content or "title" not in content or "meta_title" not in content or "meta_description" not in content: raise Exception("Meta Only content generation failed.")
-                sanitized_title = sanitize_output_title(content["title"])
-                success = await shopify.update_product(product_stub.shopify_id, title=sanitized_title, meta_title=content["meta_title"], meta_description=content["meta_description"])
+                content=await ai_service.generate_meta_only_content(cleaned_title,cleaned_description_text)
+                if not content or"title"not in content or"meta_title"not in content or"meta_description"not in content: raise Exception("Meta Only content generation failed.")
+                sanitized_title=sanitize_output_title(content["title"])
+                success=await shopify.update_product(product_stub.shopify_id,title=sanitized_title,meta_title=content["meta_title"],meta_description=content["meta_description"])
                 if not success: raise Exception("Shopify API update failed.")
             else:
-                # FULL REWRITE MODE
                 processor_logger.info(f"✍️ Full Rewrite Mode for '{cleaned_title}' (Word count: {word_count})")
-                content = await ai_service.generate_full_content(cleaned_title, cleaned_description_text)
-                if not content or "title" not in content or "description" not in content: raise Exception("Full Rewrite content generation failed.")
-                sanitized_title = sanitize_output_title(content["title"])
-                success = await shopify.update_product(product_stub.shopify_id, title=sanitized_title, description=content["description"])
+                content=await ai_service.generate_full_content(cleaned_title,cleaned_description_text)
+                if not content or"title"not in content or"description"not in content: raise Exception("Full Rewrite content generation failed.")
+                sanitized_title=sanitize_output_title(content["title"])
+                success=await shopify.update_product(product_stub.shopify_id,title=sanitized_title,description=content["description"])
                 if not success: raise Exception("Shopify API update failed.")
-            
-            product_stub.status = 'completed'; product_stub.seo_written = True; product_stub.processed_at = datetime.utcnow()
-            seo_record = SEOContent(item_id=product_stub.shopify_id, item_type='product', item_title=sanitized_title, seo_title=content.get("meta_title", sanitized_title), ai_description=content.get("description"), meta_description=content.get("meta_description"))
+            product_stub.status='completed'; product_stub.seo_written=True; product_stub.processed_at=datetime.utcnow()
+            seo_record=SEOContent(item_id=product_stub.shopify_id,item_type='product',item_title=sanitized_title,seo_title=content.get("meta_title",sanitized_title),ai_description=content.get("description"),meta_description=content.get("meta_description"))
             db.add(seo_record); processor_logger.info(f"✅ Successfully processed: {sanitized_title}")
         except Exception as e:
-            product_stub.status = 'failed'; processor_logger.error(f"❌ Failed to process product '{original_title}': {e}"); traceback.print_exc()
+            product_stub.status='failed'; processor_logger.error(f"❌ Failed to process product '{original_title}': {e}"); traceback.print_exc()
         finally: db.commit(); await asyncio.sleep(3)
     processor_logger.info("🏁 Background processing run finished.")
 
 # --- FastAPI App & Endpoints ---
-app = FastAPI(title="AI SEO Content Agent", version="FINAL-SANITIZED")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-shopify = ShopifyService()
-ai_service = SmartAIService()
+app=FastAPI(title="AI SEO Content Agent",version="FINAL-AUTONOMOUS")
+app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
+shopify=ShopifyService()
+ai_service=SmartAIService()
 
 @app.get("/")
-def root(): return {"status": "ok"}
+def root(): return{"status":"ok"}
 
 @app.post("/api/scan")
-async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    state = db.query(SystemState).first();
-    if not state: state = init_system_state(db)
-    if state.is_paused: return {"error": "System is paused"}
-    products = await shopify.get_products(); new_products = 0
+async def scan_all(background_tasks: BackgroundTasks,db: Session=Depends(get_db)):
+    state=db.query(SystemState).first();
+    if not state: state=init_system_state(db)
+    if state.is_paused: return{"error":"System is paused"}
+    products=await shopify.get_products(); new_products=0
     for p in products:
-        if not db.query(Product).filter(Product.shopify_id == str(p.get('id'))).first():
-            db.add(Product(shopify_id=str(p.get('id')), title=p.get('title'), handle=p.get('handle'), status='pending')); new_products += 1
-    collections = await shopify.get_collections(); new_collections = 0
+        if not db.query(Product).filter(Product.shopify_id==str(p.get('id'))).first():
+            db.add(Product(shopify_id=str(p.get('id')),title=p.get('title'),handle=p.get('handle'),status='pending')); new_products+=1
+    collections=await shopify.get_collections(); new_collections=0
     for c in collections:
-        if not db.query(Collection).filter(Collection.shopify_id == str(c.get('id'))).first():
-            db.add(Collection(shopify_id=str(c.get('id')), title=c.get('title'), handle=c.get('handle'), products_count=c.get('products_count',0), status='pending')); new_collections += 1
+        if not db.query(Collection).filter(Collection.shopify_id==str(c.get('id'))).first():
+            db.add(Collection(shopify_id=str(c.get('id')),title=c.get('title'),handle=c.get('handle'),products_count=c.get('products_count',0),status='pending')); new_collections+=1
     state.last_scan=datetime.utcnow(); state.products_found_in_last_scan=new_products; state.collections_found_in_last_scan=new_collections
-    if (new_products+new_collections)>100: state.is_paused=True; state.auto_pause_triggered=True
+    if(new_products+new_collections)>100: state.is_paused=True; state.auto_pause_triggered=True
     db.commit()
-    if not state.is_paused and (new_products > 0 or new_collections > 0):
-        background_tasks.add_task(process_pending_items, db)
-    return {"products_found":new_products, "collections_found":new_collections}
+    if not state.is_paused and(new_products>0 or new_collections>0):
+        background_tasks.add_task(process_pending_items,db)
+    return{"products_found":new_products,"collections_found":new_collections}
 
 @app.post("/api/process-queue")
-async def trigger_processing(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    state = db.query(SystemState).first()
-    if state and state.is_paused: return {"error":"System is paused"}
-    background_tasks.add_task(process_pending_items, db)
-    return {"message": "Processing task started in the background."}
+async def trigger_processing(background_tasks: BackgroundTasks,db: Session=Depends(get_db)):
+    state=db.query(SystemState).first()
+    if state and state.is_paused: return{"error":"System is paused"}
+    background_tasks.add_task(process_pending_items,db)
+    return{"message":"Processing task started in the background."}
 
 @app.get("/api/dashboard")
 async def get_dashboard(db: Session = Depends(get_db)):
-    state = db.query(SystemState).first();
-    if not state: state = init_system_state(db)
-    total_products = db.query(Product).count(); completed_products = db.query(Product).filter(Product.status == "completed").count(); pending_products = db.query(Product).filter(Product.status == "pending").count()
-    total_collections = db.query(Collection).count(); completed_collections = db.query(Collection).filter(Collection.status == "completed").count(); pending_collections = db.query(Collection).filter(Collection.status == "pending").count()
-    recent_products = db.query(Product).order_by(Product.updated_at.desc()).limit(5).all()
-    recent_collections = db.query(Collection).order_by(Collection.updated_at.desc()).limit(5).all()
-    recent_activity = [{'id':p.shopify_id,'title':p.title,'type':'product','status':p.status,'updated':p.updated_at.isoformat() if p.updated_at else None} for p in recent_products] + [{'id':c.shopify_id,'title':c.title,'type':'collection','status':c.status,'updated':c.updated_at.isoformat() if c.updated_at else None} for c in recent_collections]
-    recent_activity.sort(key=lambda x: x["updated"] or "", reverse=True)
-    return {
-        "system": {"is_paused": state.is_paused, "auto_pause_triggered": state.auto_pause_triggered, "last_scan": state.last_scan.isoformat() if state.last_scan else None},
-        "stats": { "products": {"total": total_products, "completed": completed_products, "pending": pending_products}, "collections": {"total": total_collections, "completed": completed_collections, "pending": pending_collections}, "total_completed": completed_products + completed_collections },
-        "recent_activity": recent_activity[:10]
+    state=db.query(SystemState).first();
+    if not state: state=init_system_state(db)
+    total_products=db.query(Product).count(); completed_products=db.query(Product).filter(Product.status=="completed").count(); pending_products=db.query(Product).filter(Product.status=="pending").count()
+    total_collections=db.query(Collection).count(); completed_collections=db.query(Collection).filter(Collection.status=="completed").count(); pending_collections=db.query(Collection).filter(Collection.status=="pending").count()
+    recent_products=db.query(Product).order_by(Product.updated_at.desc()).limit(5).all()
+    recent_collections=db.query(Collection).order_by(Collection.updated_at.desc()).limit(5).all()
+    recent_activity=[{'id':p.shopify_id,'title':p.title,'type':'product','status':p.status,'updated':p.updated_at.isoformat() if p.updated_at else None} for p in recent_products]+[{'id':c.shopify_id,'title':c.title,'type':'collection','status':c.status,'updated':c.updated_at.isoformat() if c.updated_at else None} for c in recent_collections]
+    recent_activity.sort(key=lambda x:x["updated"]or"",reverse=True)
+    return{
+        "system":{"is_paused":state.is_paused,"auto_pause_triggered":state.auto_pause_triggered,"last_scan":state.last_scan.isoformat() if state.last_scan else None},
+        "stats":{"products":{"total":total_products,"completed":completed_products,"pending":pending_products},"collections":{"total":total_collections,"completed":completed_collections,"pending":pending_collections},"total_completed":completed_products+completed_collections},
+        "recent_activity":recent_activity[:10]
     }
 
 @app.post("/api/pause")
-async def toggle_pause(db: Session = Depends(get_db)):
-    state = db.query(SystemState).first();
-    if not state: state = init_system_state(db)
-    state.is_paused = not state.is_paused; state.auto_pause_triggered = False; db.commit()
-    return {"is_paused": state.is_paused}
+async def toggle_pause(db: Session=Depends(get_db)):
+    state=db.query(SystemState).first();
+    if not state: state=init_system_state(db)
+    state.is_paused=not state.is_paused; state.auto_pause_triggered=False; db.commit()
+    return{"is_paused":state.is_paused}
 
 @app.post("/api/cron/run-tasks")
-async def trigger_cron_processing(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+async def trigger_cron_processing(background_tasks: BackgroundTasks, x_cron_secret: str = Header(None), db: Session = Depends(get_db)):
+    """A secure endpoint for the Railway Cron Job to call."""
+    cron_secret = os.getenv("CRON_SECRET")
+    if not cron_secret or x_cron_secret != cron_secret:
+        api_logger.warning("🚫 Unauthorized cron attempt.")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     api_logger.info("🤖 Cron job triggered by Railway scheduler.")
     state = db.query(SystemState).first()
     if not state: state = init_system_state(db)
+
     if state.is_paused:
         processor_logger.info("⏸️ Cron job skipped: System is currently paused.")
         return {"message": "Skipped: System is paused."}
+        
     api_logger.info("🤖 Cron: Kicking off automatic scan and process.")
     await scan_all(background_tasks, db)
     return {"message": "Automated scan and process task scheduled."}
