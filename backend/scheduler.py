@@ -3,8 +3,8 @@ import os
 from main import SessionLocal, init_system_state, SystemState, Product
 from main import bulk_scan, process_pending_items
 
-SLEEP_SECONDS = int(os.getenv("SCHEDULER_SLEEP_SECONDS", "300"))  # default 5 minutes
-BATCH_MIN_PENDING = int(os.getenv("BATCH_MIN_PENDING", "1"))     # if queue empty, auto-scan
+SLEEP_SECONDS = int(os.getenv("SCHEDULER_SLEEP_SECONDS", "300"))  # 5 minutes
+BATCH_MIN_PENDING = int(os.getenv("BATCH_MIN_PENDING", "1"))     # auto-scan if below
 
 async def run_once():
     db = SessionLocal()
@@ -18,7 +18,6 @@ async def run_once():
         print(f"--- WORKER: Pending/Failed in queue: {pending}")
 
         if pending < BATCH_MIN_PENDING:
-            # Auto-scan to refill queue
             counts = await bulk_scan(db)
             print(f"--- WORKER: Auto-scan complete. New queued -> products: {counts['new_products']}, collections: {counts['new_collections']}")
             pending = db.query(Product).filter(Product.status.in_(["pending", "failed"])).count()
@@ -27,7 +26,6 @@ async def run_once():
             await process_pending_items(db)
         else:
             print("--- WORKER: Nothing to process this cycle.")
-
     finally:
         db.close()
 
