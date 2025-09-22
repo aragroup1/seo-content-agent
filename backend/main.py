@@ -7,7 +7,7 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text, JSON
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text
 from sqlalchemy.orm import declarative_base, Session, sessionmaker
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -59,8 +59,7 @@ def html_to_text(html_content: str) -> str:
 # --- Services ---
 class ShopifyService:
     def __init__(self, client: httpx.AsyncClient):
-        self.client = client
-        self.shop_domain = os.getenv("SHOPIFY_SHOP_DOMAIN"); self.access_token = os.getenv("SHOPIFY_ACCESS_TOKEN"); self.api_version = "2024-01"; self.configured = bool(self.shop_domain and self.access_token)
+        self.client = client; self.shop_domain = os.getenv("SHOPIFY_SHOP_DOMAIN"); self.access_token = os.getenv("SHOPIFY_ACCESS_TOKEN"); self.api_version = "2024-01"; self.configured = bool(self.shop_domain and self.access_token)
         if self.configured: self.base_url = f"https://{self.shop_domain}/admin/api/{self.api_version}"; self.headers = {"X-Shopify-Access-Token": self.access_token, "Content-Type": "application/json"}
     async def get_all_paginated_resources(self, endpoint: str, resource_key: str, fields: str):
         if not self.configured: return []
@@ -69,12 +68,9 @@ class ShopifyService:
         while url:
             try:
                 resp = await self.client.get(url, headers=self.headers, timeout=45)
-                resp.raise_for_status()
-                data = resp.json().get(resource_key, [])
-                resources.extend(data)
-                shopify_logger.info(f"Fetched page {page_count} ({len(data)} items) from {endpoint}.")
-                link_header = resp.headers.get("Link")
-                match = re.search(r'<[^>]*[?&]page_info=([^&>]+)[^>]*>;\s*rel="next"', link_header or "")
+                resp.raise_for_status(); data = resp.json().get(resource_key, [])
+                resources.extend(data); shopify_logger.info(f"Fetched page {page_count} ({len(data)} items) from {endpoint}.")
+                link_header = resp.headers.get("Link"); match = re.search(r'<[^>]*[?&]page_info=([^&>]+)[^>]*>;\s*rel="next"', link_header or "")
                 page_info = match.group(1) if match else None
                 if page_info: url = f"{self.base_url}/{endpoint}.json?limit=250&fields={fields}&page_info={page_info}"; page_count += 1
                 else: url = None
@@ -102,10 +98,7 @@ class ShopifyService:
 
 class SmartAIService:
     def __init__(self, client: httpx.AsyncClient):
-        self.client = client
-        self.api_key = os.getenv("OPENAI_API_KEY")
-        self.openai_configured = bool(self.api_key)
-        self.model = "gpt-3.5-turbo"
+        self.client = client; self.api_key = os.getenv("OPENAI_API_KEY"); self.openai_configured = bool(self.api_key); self.model = "gpt-3.5-turbo"
         if self.openai_configured: self.openai_headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
     async def generate_full_content(self, title: str, existing_description: str) -> dict:
         if not self.openai_configured: return {}
@@ -114,28 +107,31 @@ class SmartAIService:
         try:
             resp = await self.client.post("https://api.openai.com/v1/chat/completions", headers=self.openai_headers, json=payload, timeout=60)
             resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
+            return json.loads(resp.json()["choices"][0]["message"]["content"])
         except Exception as e: openai_logger.error(f"AI full content error for '{title}': {e}"); return {}
     async def generate_meta_only_content(self, title: str, existing_description: str) -> dict:
         if not self.openai_configured: return {}
-        prompt = f'Based on the product title "{title}" and this existing description: "{existing_description[:1000]}...", create: 1. A new main `title` for the product page (descriptive, 60-70 characters). 2. A new SEO `meta_title` for search engines (60-70 characters). 3. A compelling `meta_description` (max 155 chars). Format the response as a valid JSON object with "title", "meta_title", and "meta_description" keys.'
+        prompt = f'Based on the product title "{title}" and this existing description: "{existing_description[:1000]}...", create: 1. A new main `title` for the product page (descriptive, 60-70 characters). 2. A new SEO `meta_title` for search engines (60-70 characters). 3. A compelling `meta_description` (max 155 chars). Format as a valid JSON object with "title", "meta_title", and "meta_description" keys.'
         payload = {"model": self.model, "messages": [{"role":"system","content":"You are an expert SEO copywriter creating metadata. Ensure your response is valid JSON."},{"role":"user","content":prompt}], "temperature":0.7, "max_tokens":300, "response_format":{"type":"json_object"}}
         try:
             resp = await self.client.post("https://api.openai.com/v1/chat/completions", headers=self.openai_headers, json=payload, timeout=60)
             resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
+            return json.loads(resp.json()["choices"][0]["message"]["content"])
         except Exception as e: openai_logger.error(f"AI meta only error for '{title}': {e}"); return {}
 
 # --- App Context & Lifespan ---
 app_state = {}
-@asyncio.contextmanager
-async def lifespan(app: FastAPI):
-    app_state["http_client"] = httpx.AsyncClient()
-    yield
-    await app_state["http_client"].aclose()
+app = FastAPI(title="AI SEO Content Agent", version="STABLE-FINAL-V2")
 
-app = FastAPI(title="AI SEO Content Agent", version="STABLE-FINAL", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+@app.on_event("startup")
+async def startup_event():
+    app_state["http_client"] = httpx.AsyncClient()
+    logger.info("HTTP client started.")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await app_state["http_client"].aclose()
+    logger.info("HTTP client closed.")
 
 # --- Background Processing ---
 async def process_pending_items(db: Session, http_client: httpx.AsyncClient):
@@ -154,18 +150,16 @@ async def process_pending_items(db: Session, http_client: httpx.AsyncClient):
             cleaned_title = clean_input_text(original_title); cleaned_desc_text = clean_input_text(html_to_text(existing_desc))
             word_count = len(cleaned_desc_text.split())
             processor_logger.info(f"⚙️ Processing: '{original_title}' -> '{cleaned_title}' (desc words: {word_count})")
-            content_str = ""
+            content = {}
             if word_count >= WORD_COUNT_THRESHOLD:
                 processor_logger.info(f"🎯 Meta Only Mode")
-                content_str = await ai_service.generate_meta_only_content(cleaned_title, cleaned_desc_text)
-                content = json.loads(content_str)
+                content = await ai_service.generate_meta_only_content(cleaned_title, cleaned_desc_text)
                 if not content or "title" not in content: raise Exception("Meta-only AI output invalid")
                 sanitized_title = sanitize_output_title(content["title"])
                 success = await shopify.update_product(product_stub.shopify_id, title=sanitized_title, meta_title=content.get("meta_title"), meta_description=content.get("meta_description"))
             else:
                 processor_logger.info(f"✍️ Full Rewrite Mode")
-                content_str = await ai_service.generate_full_content(cleaned_title, cleaned_desc_text)
-                content = json.loads(content_str)
+                content = await ai_service.generate_full_content(cleaned_title, cleaned_desc_text)
                 if not content or "title" not in content: raise Exception("Full-rewrite AI output invalid")
                 sanitized_title = sanitize_output_title(content["title"])
                 success = await shopify.update_product(product_stub.shopify_id, title=sanitized_title, description=content.get("description"))
@@ -179,9 +173,10 @@ async def process_pending_items(db: Session, http_client: httpx.AsyncClient):
     processor_logger.info("🏁 Background processing run finished.")
 
 # --- API Endpoints ---
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
 @app.get("/")
 def root(): return {"status": "ok"}
-
 @app.get("/api/health")
 def health(): return {"ok": True, "service": "backend", "time": datetime.utcnow().isoformat()}
 
@@ -195,6 +190,7 @@ async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_
     for p in products:
         if str(p.get('id')) not in existing_pids: db.add(Product(shopify_id=str(p.get('id')), title=p.get('title'), status='pending')); new_products += 1
     db.commit()
+    # Simplified scan for collections
     return {"products_found": new_products, "message": "Scan complete."}
 
 @app.post("/api/process-queue")
@@ -227,3 +223,5 @@ async def toggle_pause(db: Session = Depends(get_db)):
 async def get_logs(db: Session = Depends(get_db)):
     logs = db.query(SEOContent).order_by(SEOContent.generated_at.desc()).limit(50).all()
     return {"logs": [{'item_id': log.item_id, 'item_type': log.item_type, 'item_title': log.item_title, 'generated_at': log.generated_at.isoformat()} for log in logs]}
+
+# ... (You can add your manual-queue endpoints back here if you need them)
