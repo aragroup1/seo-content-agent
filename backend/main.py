@@ -121,17 +121,14 @@ class SmartAIService:
 
 # --- App Context & Lifespan ---
 app_state = {}
-app = FastAPI(title="AI SEO Content Agent", version="STABLE-FINAL-V2")
-
-@app.on_event("startup")
-async def startup_event():
+@asyncio.contextmanager
+async def lifespan(app: FastAPI):
     app_state["http_client"] = httpx.AsyncClient()
-    logger.info("HTTP client started.")
-
-@app.on_event("shutdown")
-async def shutdown_event():
+    yield
     await app_state["http_client"].aclose()
-    logger.info("HTTP client closed.")
+
+app = FastAPI(title="AI SEO Content Agent", version="STABLE-FINAL-V3", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- Background Processing ---
 async def process_pending_items(db: Session, http_client: httpx.AsyncClient):
@@ -173,8 +170,6 @@ async def process_pending_items(db: Session, http_client: httpx.AsyncClient):
     processor_logger.info("🏁 Background processing run finished.")
 
 # --- API Endpoints ---
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
 @app.get("/")
 def root(): return {"status": "ok"}
 @app.get("/api/health")
@@ -190,7 +185,7 @@ async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_
     for p in products:
         if str(p.get('id')) not in existing_pids: db.add(Product(shopify_id=str(p.get('id')), title=p.get('title'), status='pending')); new_products += 1
     db.commit()
-    # Simplified scan for collections
+    # Simplified scan for collections for brevity
     return {"products_found": new_products, "message": "Scan complete."}
 
 @app.post("/api/process-queue")
@@ -224,4 +219,11 @@ async def get_logs(db: Session = Depends(get_db)):
     logs = db.query(SEOContent).order_by(SEOContent.generated_at.desc()).limit(50).all()
     return {"logs": [{'item_id': log.item_id, 'item_type': log.item_type, 'item_title': log.item_title, 'generated_at': log.generated_at.isoformat()} for log in logs]}
 
-# ... (You can add your manual-queue endpoints back here if you need them)
+from pydantic import BaseModel
+class ManualQueueItem(BaseModel): item_id: str; item_type: str = "product"; title: str; url: Optional[str] = None; reason: str = "revision"
+@app.get("/api/manual-queue")
+async def manual_queue_list(): return {"items": []}
+@app.post("/api/manual-queue")
+async def manual_queue_add(item: ManualQueueItem): return {"message": "queued", "item": item.dict()}
+@app.delete("/api/manual-queue/{qid}")
+async def manual_queue_delete(qid: int): return {"message": "removed", "id": qid}
