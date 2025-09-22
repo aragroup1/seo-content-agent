@@ -1,6 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  output: 'standalone',
+  // This is the magic line that creates the standalone server
+  output: 'standalone', 
 };
 
 export default nextConfig;
