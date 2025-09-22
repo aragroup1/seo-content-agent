@@ -107,8 +107,11 @@ def clean_input_text(text: str) -> str:
     if not text:
         return ""
     t = text
-    t = re.sub(r'#?value!?', '', t, flags=re.IGNORECASE)     # remove #VALUE! artifacts
-    t = re.sub(r'^KATEX_INLINE_OPEN.*KATEX_INLINE_CLOSE\s*', '', t)                         # remove leading (M), (S), etc.
+    # Remove Excel artifacts like #VALUE!
+    t = re.sub(r'#?value!?', '', t, flags=re.IGNORECASE)
+    # Remove prefixes like (M), (S)
+    t = re.sub(r'^KATEX_INLINE_OPEN.*KATEX_INLINE_CLOSE\s*', '', t)
+    # Remove shipping phrases, inside or outside parentheses
     patt = r'\s*KATEX_INLINE_OPEN(?:' + '|'.join(map(re.escape, SHIPPING_PHRASES)) + r')KATEX_INLINE_CLOSE\s*|\s*(?:' + '|'.join(map(re.escape, SHIPPING_PHRASES)) + r')\s*'
     t = re.sub(patt, ' ', t, flags=re.IGNORECASE)
     return re.sub(r'\s+', ' ', t).strip()
@@ -215,6 +218,7 @@ class ShopifyService:
             except httpx.HTTPStatusError as e:
                 shopify_logger.error(f"Shopify custom_collections page failed: {e}")
                 break
+
         shopify_logger.info(f"Total collections fetched: {len(collections)}")
         return collections
 
@@ -259,7 +263,7 @@ class ShopifyService:
                 shopify_logger.error(f"❌ Shopify update failed for product {product_id}: {e}")
                 return False
 
-# ------------------- AI Service (JSON prompts) -------------------
+# ------------------- AI Service (JSON prompts + fallbacks) -------------------
 class SmartAIService:
     def __init__(self):
         api_key = os.getenv("OPENAI_API_KEY")
@@ -268,9 +272,44 @@ class SmartAIService:
         if self.client:
             openai_logger.info("✅ AI Service configured - Smart Mode (model: gpt-3.5-turbo)")
 
+    def _try_parse_json(self, text: str) -> Optional[dict]:
+        # Try strict JSON
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        # Try extracting first JSON object
+        m = re.search(r'\{.*\}', text, flags=re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return None
+        return None
+
+    def _fallback_full(self, title: str, existing_description: str) -> dict:
+        # Deterministic minimal valid JSON
+        t = sanitize_output_title(title)[:70]
+        desc_text = (existing_description or "").strip()
+        if not desc_text:
+            desc_text = f"{t} is designed for everyday use. Built for quality and reliability."
+        # Build two short paragraphs ~120 words max
+        para1 = desc_text[:300]
+        para2 = "Shop with confidence — fast shipping and great value."
+        html = f"<p>{para1}</p><p>{para2}</p>"
+        return {"title": t, "description": html}
+
+    def _fallback_meta(self, title: str, existing_description: str) -> dict:
+        t = sanitize_output_title(title)[:70]
+        meta_title = t[:70]
+        meta_desc_base = (existing_description or t)
+        meta_desc = re.sub(r'\s+', ' ', meta_desc_base)[:150]
+        return {"title": t, "meta_title": meta_title, "meta_description": meta_desc}
+
     async def generate_full_content(self, title: str, existing_description: str) -> dict:
         if not self.client:
-            return {}
+            return self._fallback_full(title, existing_description)
+
         prompt = f'''
 Act as an expert SEO copy editor for the product "{title}". Use the existing description (below) as context, but create a better, more complete version.
 
@@ -293,14 +332,36 @@ Existing Description:
                 max_tokens=420,
                 response_format={"type": "json_object"}
             )
-            return json.loads(resp.choices[0].message.content)
+            text = resp.choices[0].message.content or ""
+            obj = self._try_parse_json(text)
+            if not obj or "title" not in obj or "description" not in obj:
+                openai_logger.warning(f"[FULL] JSON parse failed, raw (trunc): {text[:300]}")
+                # Retry without response_format to be lenient
+                resp2 = await asyncio.to_thread(
+                    self.client.chat.completions.create,
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": "Return ONLY valid JSON with the required keys."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.6,
+                    max_tokens=420
+                )
+                text2 = resp2.choices[0].message.content or ""
+                obj2 = self._try_parse_json(text2)
+                if not obj2 or "title" not in obj2 or "description" not in obj2:
+                    openai_logger.warning(f"[FULL] Retry parse failed, raw (trunc): {text2[:300]}")
+                    return self._fallback_full(title, existing_description)
+                return obj2
+            return obj
         except Exception as e:
             openai_logger.error(f"AI full content error for '{title}': {e}")
-            return {}
+            return self._fallback_full(title, existing_description)
 
     async def generate_meta_only_content(self, title: str, existing_description: str) -> dict:
         if not self.client:
-            return {}
+            return self._fallback_meta(title, existing_description)
+
         prompt = f'''
 Based on the product title "{title}" and the existing description (below), create ONLY the page title and meta tags.
 
@@ -324,10 +385,31 @@ Existing Description:
                 max_tokens=280,
                 response_format={"type": "json_object"}
             )
-            return json.loads(resp.choices[0].message.content)
+            text = resp.choices[0].message.content or ""
+            obj = self._try_parse_json(text)
+            if not obj or "title" not in obj or "meta_title" not in obj or "meta_description" not in obj:
+                openai_logger.warning(f"[META] JSON parse failed, raw (trunc): {text[:300]}")
+                # Retry without response_format
+                resp2 = await asyncio.to_thread(
+                    self.client.chat.completions.create,
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": "Return ONLY valid JSON with the required keys."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.6,
+                    max_tokens=280
+                )
+                text2 = resp2.choices[0].message.content or ""
+                obj2 = self._try_parse_json(text2)
+                if not obj2 or "title" not in obj2 or "meta_title" not in obj2 or "meta_description" not in obj2:
+                    openai_logger.warning(f"[META] Retry parse failed, raw (trunc): {text2[:300]}")
+                    return self._fallback_meta(title, existing_description)
+                return obj2
+            return obj
         except Exception as e:
             openai_logger.error(f"AI meta-only error for '{title}': {e}")
-            return {}
+            return self._fallback_meta(title, existing_description)
 
 shopify = ShopifyService()
 ai_service = SmartAIService()
@@ -337,7 +419,6 @@ async def bulk_scan(db: Session) -> Dict[str, int]:
     products = await shopify.get_all_products(limit=250)
     collections = await shopify.get_all_collections(limit=250)
 
-    # Preload existing IDs to avoid UNIQUE conflicts
     existing_product_ids = {row[0] for row in db.query(Product.shopify_id).all()}
     existing_collection_ids = {row[0] for row in db.query(Collection.shopify_id).all()}
 
@@ -359,8 +440,7 @@ async def bulk_scan(db: Session) -> Dict[str, int]:
         new_p += 1
         if new_p % CHUNK == 0:
             try:
-                db.flush()
-                db.commit()
+                db.flush(); db.commit()
             except IntegrityError:
                 db.rollback()
 
@@ -380,10 +460,8 @@ async def bulk_scan(db: Session) -> Dict[str, int]:
         seen_new_c.add(sid)
         new_c += 1
 
-    # Final commit
     try:
-        db.flush()
-        db.commit()
+        db.flush(); db.commit()
     except IntegrityError:
         db.rollback()
         api_logger.warning("IntegrityError on final commit during bulk_scan; duplicates skipped.")
@@ -426,30 +504,26 @@ async def process_pending_items(db: Session):
             if word_count >= WORD_COUNT_THRESHOLD:
                 # META ONLY MODE
                 content = await ai_service.generate_meta_only_content(cleaned_title, cleaned_desc_text)
-                if not content or "title" not in content or "meta_title" not in content or "meta_description" not in content:
-                    raise Exception("Meta-only AI output invalid")
-                title_new = sanitize_output_title(content["title"])
+                title_new = sanitize_output_title(content.get("title", cleaned_title))[:70]
                 ok = await shopify.update_product(
                     p.shopify_id,
                     title=title_new,
-                    meta_title=content["meta_title"],
-                    meta_description=content["meta_description"]
+                    meta_title=content.get("meta_title", title_new)[:70],
+                    meta_description=(content.get("meta_description") or "")[:155]
                 )
                 if not ok:
                     raise Exception("Shopify meta-only update failed")
                 record = SEOContent(
                     item_id=p.shopify_id, item_type="product",
-                    item_title=title_new, seo_title=content["meta_title"],
-                    meta_description=content["meta_description"]
+                    item_title=title_new, seo_title=content.get("meta_title", title_new)[:70],
+                    meta_description=(content.get("meta_description") or "")[:155]
                 )
                 db.add(record)
             else:
                 # FULL REWRITE MODE
                 content = await ai_service.generate_full_content(cleaned_title, cleaned_desc_text)
-                if not content or "title" not in content or "description" not in content:
-                    raise Exception("Full-rewrite AI output invalid")
-                title_new = sanitize_output_title(content["title"])
-                desc_new = content["description"]
+                title_new = sanitize_output_title(content.get("title", cleaned_title))[:70]
+                desc_new = content.get("description") or f"<p>{cleaned_title}</p>"
                 ok = await shopify.update_product(
                     p.shopify_id,
                     title=title_new,
@@ -481,10 +555,10 @@ async def process_pending_items(db: Session):
     processor_logger.info("🏁 Background processing run finished.")
 
 # ------------------- FastAPI app -------------------
-app = FastAPI(title="AI SEO Content Agent", version="auto-worker-1.3")
+app = FastAPI(title="AI SEO Content Agent", version="auto-worker-1.4")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # lock to your frontend origin if you want stricter CORS
+    allow_origins=["*"],  # lock to your frontend domain if desired
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
@@ -500,11 +574,13 @@ def health():
 
 @app.post("/api/scan")
 async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    api_logger.info("🚀 Scan initiated.")
     state = db.query(SystemState).first() or init_system_state(db)
     if state.is_paused:
         return {"error": "System is paused"}
     try:
         counts = await bulk_scan(db)
+        api_logger.info(f"✅ Scan complete. Found {counts['new_products']} new products, {counts['new_collections']} new collections.")
         if not state.is_paused and (counts["new_products"] + counts["new_collections"]) > 0:
             background_tasks.add_task(process_pending_items, db)
         return {"queued": counts, "paused": state.is_paused}
