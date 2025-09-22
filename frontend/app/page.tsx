@@ -28,6 +28,8 @@ export default function Dashboard() {
   const [newItem, setNewItem] = useState({ item_id: '', item_type: 'product', title: '', url: '', reason: 'revision' });
   const [errMsg, setErrMsg] = useState<string | null>(null);
 
+  const api = useMemo(() => axios.create({ baseURL: API_URL, timeout: 30000 }), [API_URL]);
+
   async function safe<T>(fn: () => Promise<T>) {
     try {
       setErrMsg(null);
@@ -43,20 +45,17 @@ export default function Dashboard() {
   }
 
   const fetchDashboard = async () => {
-    const res = await safe(() => axios.get(`${API_URL}/api/dashboard`));
-    if (res && res.data) setDashboard(res.data);
+    try { const res = await safe(() => api.get('/api/dashboard')); if (res && res.data) setDashboard(res.data); } catch (e) {}
   };
   const fetchLogs = async () => {
-    const res = await safe(() => axios.get(`${API_URL}/api/logs`));
-    if (res && res.data) setLogs(res.data.logs || []);
+    try { const res = await safe(() => api.get('/api/logs')); if (res && res.data) setLogs(res.data.logs || []); } catch (e) {}
   };
   const fetchManualQueue = async () => {
-    const res = await safe(() => axios.get(`${API_URL}/api/manual-queue`));
-    if (res && res.data) setManualQueue(res.data.items || []);
+    try { const res = await safe(() => api.get('/api/manual-queue')); if (res && res.data) setManualQueue(res.data.items || []); } catch (e) {}
   };
 
   useEffect(() => {
-    (async () => { await Promise.allSettled([fetchDashboard(), fetchLogs(), fetchManualQueue()]); })();
+    fetchDashboard(); fetchLogs(); fetchManualQueue();
     const id = setInterval(() => {
       fetchDashboard();
       if (activeTab === 'logs') fetchLogs();
@@ -70,7 +69,6 @@ export default function Dashboard() {
     setProcessing(true);
     try {
       await safe(fn);
-      // Give the backend a moment to process before we refresh the data
       setTimeout(() => {
         fetchDashboard();
         fetchLogs();
@@ -82,36 +80,19 @@ export default function Dashboard() {
     }
   };
 
-  const scanAll = () => handleApiAction(() => axios.post(`${API_URL}/api/scan`));
-  const processQueue = () => handleApiAction(() => axios.post(`${API_URL}/api/process-queue`));
-  const togglePause = () => handleApiAction(() => axios.post(`${API_URL}/api/pause`));
+  const scanAll = () => handleApiAction(() => api.post('/api/scan'));
+  const processQueue = () => handleApiAction(() => api.post('/api/process-queue'));
+  const togglePause = () => handleApiAction(() => api.post('/api/pause'));
   const addToManualQueue = () => {
-    handleApiAction(() => axios.post(`${API_URL}/api/manual-queue`, newItem));
+    handleApiAction(() => api.post('/api/manual-queue', newItem));
     setShowAddModal(false);
     setNewItem({ item_id: '', item_type: 'product', title: '', url: '', reason: 'revision'});
   };
-  const removeFromQueue = (id: number) => handleApiAction(() => axios.delete(`${API_URL}/api/manual-queue/${id}`));
-  const generateContent = (item_id: string, item_type: string) => handleApiAction(() => axios.post(`${API_URL}/api/generate-content`, { item_id, item_type, regenerate: true }));
-  const testConnection = async () => {
-    try {
-        await safe(() => axios.get(`${API_URL}/api/health`));
-        alert(`✅ Connection successful!\nFrontend can reach the backend at:\n${API_URL}`);
-    } catch (e: any) {
-        // Error is already handled by safe() and displayed in errMsg
-    }
-  };
-
+  const removeFromQueue = (id: number) => handleApiAction(() => api.delete(`/api/manual-queue/${id}`));
+  const generateContent = (item_id: string, item_type: string) => handleApiAction(() => api.post(`/api/generate-content`, { item_id, item_type, regenerate: true }));
+  
   if (!dashboard) {
-    return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-        <div className="text-center">
-          <Activity className="w-12 h-12 text-gray-400 animate-pulse mx-auto mb-4" />
-          <p className="text-gray-500">Connecting to AI Agent...</p>
-          <p className="text-xs text-gray-400 mt-2">API: {API_URL}</p>
-          <button onClick={testConnection} className="mt-4 px-4 py-2 bg-gray-200 rounded-lg text-sm">Test Connection</button>
-        </div>
-      </div>
-    );
+    return (<div className="min-h-screen bg-gray-50 flex items-center justify-center"><div className="text-center"><Activity className="w-12 h-12 text-gray-400 animate-pulse mx-auto mb-4" /><p className="text-gray-500">Connecting to AI Agent...</p><p className="text-xs text-gray-400 mt-2">API: {API_URL}</p></div></div>);
   }
 
   return (
@@ -120,28 +101,18 @@ export default function Dashboard() {
         <div className="max-w-7xl mx-auto px-6 py-4">
           <div className="flex justify-between items-center">
             <div className="flex items-center space-x-3">
-              <div className="p-2 bg-gradient-to-br from-purple-500 to-pink-500 rounded-xl">
-                <Sparkles className="w-6 h-6 text-white" />
-              </div>
-              <div>
-                <h1 className="text-2xl font-bold bg-gradient-to-r from-purple-600 to-pink-600 bg-clip-text text-transparent">AI SEO Content Agent</h1>
-                <p className="text-xs text-gray-600">API: {API_URL}</p>
-              </div>
+              <div className="p-2 bg-gradient-to-br from-purple-500 to-pink-500 rounded-xl"><Sparkles className="w-6 h-6 text-white" /></div>
+              <div><h1 className="text-2xl font-bold bg-gradient-to-r from-purple-600 to-pink-600 bg-clip-text text-transparent">AI SEO Content Agent</h1><p className="text-sm text-gray-600">Cost-Effective Content Generation</p></div>
             </div>
             <div className={`px-6 py-3 rounded-2xl font-medium transition-all ${dashboard.system.is_paused ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'} shadow-lg`}>
-              <div className="flex items-center space-x-2">
-                {dashboard.system.is_paused ? (
-                  <><div className="w-2 h-2 bg-red-500 rounded-full"></div><span>PAUSED</span></>
-                ) : (
-                  <><div className="w-2 h-2 bg-green-500 rounded-full relative before:absolute before:-inset-1 before:bg-current before:rounded-full before:opacity-75 before:animate-ping"></div><span>ACTIVE</span></>
-                )}
-              </div>
+              <div className="flex items-center space-x-2">{dashboard.system.is_paused ? (<><div className="w-2 h-2 bg-red-500 rounded-full"></div><span>PAUSED</span></>) : (<><div className="w-2 h-2 bg-green-500 rounded-full relative before:absolute before:-inset-1 before:bg-current before:rounded-full before:opacity-75 before:animate-ping"></div><span>ACTIVE</span></>)}</div>
             </div>
           </div>
         </div>
       </header>
       <div className="max-w-7xl mx-auto px-6 py-6">
         <div className="flex space-x-1 p-1 bg-white/50 backdrop-blur-sm rounded-2xl shadow-inner">
+          {/* --- THIS IS THE FIX --- */}
           {(['overview', 'manual', 'logs'] as TabType[]).map((tab) => (
             <button key={tab} onClick={() => setActiveTab(tab)} className={`flex-1 py-3 px-6 rounded-xl font-medium transition-all ${activeTab === tab ? 'bg-white text-purple-600 shadow-lg' : 'text-gray-600 hover:text-gray-900'}`}>{tab.charAt(0).toUpperCase() + tab.slice(1)}</button>
           ))}
@@ -155,17 +126,17 @@ export default function Dashboard() {
               <ActionButton onClick={scanAll} disabled={processing || dashboard.system.is_paused} icon={<Search className="w-4 h-4" />} label="Scan All" gradient="from-blue-500 to-cyan-500" />
               <ActionButton onClick={processQueue} disabled={processing || dashboard.system.is_paused} icon={<Zap className="w-4 h-4" />} label="Process Queue" gradient="from-green-500 to-emerald-500" />
               <ActionButton onClick={togglePause} disabled={processing} icon={dashboard.system.is_paused ? <PlayCircle className="w-4 h-4" /> : <PauseCircle className="w-4 h-4" />} label={dashboard.system.is_paused ? "Resume" : "Pause"} gradient={dashboard.system.is_paused ? "from-green-500 to-emerald-500" : "from-red-500 to-pink-500"} />
-              <ActionButton onClick={testConnection} icon={<RefreshCw className="w-4 h-4" />} label="Test Connection" gradient="from-gray-500 to-gray-600" />
+              <ActionButton onClick={() => setShowAddModal(true)} icon={<Plus className="w-4 h-4" />} label="Add to Queue" gradient="from-purple-500 to-pink-500" />
             </div>
             <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
               <StatCard title="Products" stats={dashboard.stats.products} icon={<Package className="w-5 h-5" />} gradient="from-blue-500 to-cyan-500" />
               <StatCard title="Collections" stats={dashboard.stats.collections} icon={<Layers className="w-5 h-5" />} gradient="from-purple-500 to-pink-500" />
-              <StatCard title="Total Completed" value={dashboard.stats.total_completed} icon={<CheckCircle className="w-5 h-5" />} gradient="from-orange-500 to-red-500" />
-              <StatCard title="Last Scan" value={dashboard.system.last_scan ? new Date(dashboard.system.last_scan).toLocaleString() : 'Never'} icon={<Clock className="w-5 h-5" />} gradient="from-green-500 to-emerald-500" />
+              <StatCard title="Manual Queue" value={dashboard.stats.manual_queue} icon={<Edit3 className="w-5 h-5" />} gradient="from-orange-500 to-red-500" />
+              <StatCard title="Total Completed" value={dashboard.stats.total_completed} icon={<CheckCircle className="w-5 h-5" />} gradient="from-green-500 to-emerald-500" />
             </div>
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
               <div className="lg:col-span-2"><div className="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl overflow-hidden"><div className="px-6 py-4 bg-gradient-to-r from-purple-500 to-pink-500"><h2 className="text-lg font-semibold text-white">Recent Activity</h2></div><div className="divide-y divide-gray-100 max-h-96 overflow-y-auto">{!dashboard.recent_activity || dashboard.recent_activity.length === 0 ? (<div className="p-12 text-center text-gray-500"><Activity className="w-12 h-12 mx-auto mb-3 text-gray-300" /><p>No activity yet</p></div>) : (dashboard.recent_activity.map((item: any) => (<ActivityItem key={`${item.type}-${item.id}`} item={item} onRegenerate={generateContent} />)))}</div></div></div>
-              <div className="space-y-4"><InfoCard title="Found in Last Scan" value={`${dashboard.system.products_found_in_last_scan} products, ${dashboard.system.collections_found_in_last_scan} collections`} icon={<Search className="w-5 h-5" />} /><InfoCard title="Total Completed" value={dashboard.stats.total_completed} icon={<CheckCircle className="w-5 h-5" />} /></div>
+              <div className="space-y-4"><InfoCard title="Last Scan" value={dashboard.system.last_scan ? new Date(dashboard.system.last_scan).toLocaleString() : 'Never'} icon={<Clock className="w-5 h-5" />} /><InfoCard title="Found in Last Scan" value={`${dashboard.system.products_found_in_last_scan} products, ${dashboard.system.collections_found_in_last_scan} collections`} icon={<Search className="w-5 h-5" />} /><InfoCard title="Total Completed" value={dashboard.stats.total_completed} icon={<CheckCircle className="w-5 h-5" />} /></div>
             </div>
           </div>
         )}
