@@ -1,36 +1,42 @@
 import asyncio
-from main import process_pending_items, SessionLocal, init_system_state, SystemState
+import os
+from main import SessionLocal, init_system_state, SystemState, Product
+from main import bulk_scan, process_pending_items
 
-async def run():
-    """
-    This is the dedicated function that the Railway Cron Job will execute.
-    It's a simplified, direct version of the processing logic.
-    """
-    print("--- AUTONOMOUS SCHEDULER: STARTING RUN ---")
+SLEEP_SECONDS = int(os.getenv("SCHEDULER_SLEEP_SECONDS", "300"))  # default 5 minutes
+BATCH_MIN_PENDING = int(os.getenv("BATCH_MIN_PENDING", "1"))     # if queue empty, auto-scan
+
+async def run_once():
     db = SessionLocal()
     try:
-        # Check if the system is paused before doing anything
-        state = db.query(SystemState).first()
-        if not state:
-            state = init_system_state(db)
-        
+        state = db.query(SystemState).first() or init_system_state(db)
         if state.is_paused:
-            print("--- AUTONOMOUS SCHEDULER: System is paused. Skipping run. ---")
+            print("--- WORKER: System paused. Skipping this cycle.")
             return
 
-        print("--- AUTONOMOUS SCHEDULER: System is active. Starting processing... ---")
-        # Directly call the main processing function from your main.py
-        await process_pending_items(db)
+        pending = db.query(Product).filter(Product.status.in_(["pending", "failed"])).count()
+        print(f"--- WORKER: Pending/Failed in queue: {pending}")
 
-        print("--- AUTONOMOUS SCHEDULER: Processing batch complete. ---")
+        if pending < BATCH_MIN_PENDING:
+            # Auto-scan to refill queue
+            counts = await bulk_scan(db)
+            print(f"--- WORKER: Auto-scan complete. New queued -> products: {counts['new_products']}, collections: {counts['new_collections']}")
+            pending = db.query(Product).filter(Product.status.in_(["pending", "failed"])).count()
 
-    except Exception as e:
-        print(f"--- AUTONOMOUS SCHEDULER: An error occurred: {e} ---")
+        if pending > 0:
+            await process_pending_items(db)
+        else:
+            print("--- WORKER: Nothing to process this cycle.")
+
     finally:
         db.close()
-        print("--- AUTONOMOUS SCHEDULER: RUN FINISHED ---")
 
+async def loop():
+    while True:
+        print("--- WORKER: Cycle start ---")
+        await run_once()
+        print(f"--- WORKER: Sleeping {SLEEP_SECONDS}s ---")
+        await asyncio.sleep(SLEEP_SECONDS)
 
 if __name__ == "__main__":
-    print("Running scheduler script manually...")
-    asyncio.run(run())
+    asyncio.run(loop())
