@@ -7,7 +7,7 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text, JSON
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text
 from sqlalchemy.orm import declarative_base, Session, sessionmaker
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -15,46 +15,24 @@ import httpx
 import logging
 import traceback
 
-# --- Logging Setup ---
+# --- Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("main")
-shopify_logger = logging.getLogger("shopify")
-openai_logger = logging.getLogger("openai")
-db_logger = logging.getLogger("database")
-api_logger = logging.getLogger("api")
-processor_logger = logging.getLogger("processor")
-
+logger = logging.getLogger("main"); shopify_logger = logging.getLogger("shopify"); openai_logger = logging.getLogger("openai"); db_logger = logging.getLogger("database"); api_logger = logging.getLogger("api"); processor_logger = logging.getLogger("processor")
 load_dotenv()
 
-# --- Database Setup ---
+# --- Database ---
 DATABASE_URL = os.getenv("DATABASE_URL")
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-else:
-    DATABASE_URL = "sqlite:///./seo_agent.db"
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"): DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+else: DATABASE_URL = "sqlite:///./seo_agent.db"
+engine = create_engine(DATABASE_URL); SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine); Base = declarative_base()
 
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-# --- Database Models ---
-class Product(Base):
-    __tablename__ = "products"
-    id=Column(Integer,primary_key=True); shopify_id=Column(String,unique=True,index=True); title=Column(String); handle=Column(String,nullable=True); status=Column(String,default="pending"); seo_written=Column(Boolean,default=False); created_at=Column(DateTime,default=datetime.utcnow); updated_at=Column(DateTime,default=datetime.utcnow,onupdate=datetime.utcnow); processed_at=Column(DateTime,nullable=True)
-class Collection(Base):
-    __tablename__ = "collections"
-    id=Column(Integer,primary_key=True); shopify_id=Column(String,unique=True,index=True); title=Column(String); handle=Column(String,nullable=True); products_count=Column(Integer,default=0); status=Column(String,default="pending"); seo_written=Column(Boolean,default=False); created_at=Column(DateTime,default=datetime.utcnow); updated_at=Column(DateTime,default=datetime.utcnow,onupdate=datetime.utcnow); processed_at=Column(DateTime,nullable=True)
-class SEOContent(Base):
-    __tablename__ = "seo_content"
-    id=Column(Integer,primary_key=True); item_id=Column(String,index=True); item_type=Column(String); item_title=Column(String); seo_title=Column(String); meta_description=Column(String,nullable=True); ai_description=Column(Text,nullable=True); generated_at=Column(DateTime,default=datetime.utcnow)
-class SystemState(Base):
-    __tablename__ = "system_state"
-    id=Column(Integer,primary_key=True); is_paused=Column(Boolean,default=False); auto_pause_triggered=Column(Boolean,default=False); last_scan=Column(DateTime,nullable=True); products_found_in_last_scan=Column(Integer,default=0); collections_found_in_last_scan=Column(Integer,default=0); total_items_processed=Column(Integer,default=0)
-try:
-    Base.metadata.create_all(bind=engine)
-    db_logger.info("✅ DB tables verified")
-except Exception as e:
-    db_logger.error(f"❌ DB error: {e}")
+# --- Models ---
+class Product(Base): __tablename__ = "products"; id=Column(Integer,primary_key=True); shopify_id=Column(String,unique=True,index=True); title=Column(String); handle=Column(String,nullable=True); status=Column(String,default="pending"); seo_written=Column(Boolean,default=False); created_at=Column(DateTime,default=datetime.utcnow); updated_at=Column(DateTime,default=datetime.utcnow,onupdate=datetime.utcnow); processed_at=Column(DateTime,nullable=True)
+class Collection(Base): __tablename__ = "collections"; id=Column(Integer,primary_key=True); shopify_id=Column(String,unique=True,index=True); title=Column(String); handle=Column(String,nullable=True); products_count=Column(Integer,default=0); status=Column(String,default="pending"); seo_written=Column(Boolean,default=False); created_at=Column(DateTime,default=datetime.utcnow); updated_at=Column(DateTime,default=datetime.utcnow,onupdate=datetime.utcnow); processed_at=Column(DateTime,nullable=True)
+class SEOContent(Base): __tablename__ = "seo_content"; id=Column(Integer,primary_key=True); item_id=Column(String,index=True); item_type=Column(String); item_title=Column(String); seo_title=Column(String); meta_description=Column(String,nullable=True); ai_description=Column(Text,nullable=True); generated_at=Column(DateTime,default=datetime.utcnow)
+class SystemState(Base): __tablename__ = "system_state"; id=Column(Integer,primary_key=True); is_paused=Column(Boolean,default=False); auto_pause_triggered=Column(Boolean,default=False); last_scan=Column(DateTime,nullable=True); products_found_in_last_scan=Column(Integer,default=0); collections_found_in_last_scan=Column(Integer,default=0); total_items_processed=Column(Integer,default=0)
+try: Base.metadata.create_all(bind=engine); db_logger.info("✅ DB tables verified")
+except Exception as e: db_logger.error(f"❌ DB error: {e}")
 
 # --- Helpers ---
 def get_db():
@@ -168,21 +146,16 @@ async def process_pending_items(db: Session, http_client: httpx.AsyncClient):
             product_stub.status = 'processing'; db.commit()
             full_product = await shopify.get_product_details(product_stub.shopify_id)
             if not full_product: raise Exception("Could not fetch full product details")
-            
             existing_desc = full_product.get('body_html', '')
-            cleaned_title = clean_input_text(original_title); 
-            cleaned_desc_text = clean_input_text(html_to_text(existing_desc))
+            cleaned_title = clean_input_text(original_title); cleaned_desc_text = clean_input_text(html_to_text(existing_desc))
             word_count = len(cleaned_desc_text.split())
-            
             processor_logger.info(f"⚙️ Processing: '{original_title}' -> '{cleaned_title}' (desc words: {word_count})")
-            
-            # --- THIS IS THE CORRECTED LOGIC ---
             content = {}
             sanitized_title = ""
             if word_count >= WORD_COUNT_THRESHOLD:
                 processor_logger.info(f"🎯 Meta Only Mode")
                 content = await ai_service.generate_meta_only_content(cleaned_title, cleaned_desc_text)
-                if not content or "title" not in content or "meta_title" not in content: raise Exception("Meta-only AI output invalid")
+                if not content or "title" not in content: raise Exception("Meta-only AI output invalid")
                 sanitized_title = sanitize_output_title(content["title"])
                 success = await shopify.update_product(product_stub.shopify_id, title=sanitized_title, meta_title=content.get("meta_title"), meta_description=content.get("meta_description"))
             else:
@@ -191,9 +164,7 @@ async def process_pending_items(db: Session, http_client: httpx.AsyncClient):
                 if not content or "title" not in content or "description" not in content: raise Exception("Full-rewrite AI output invalid")
                 sanitized_title = sanitize_output_title(content["title"])
                 success = await shopify.update_product(product_stub.shopify_id, title=sanitized_title, description=content.get("description"))
-            
             if not success: raise Exception("Shopify API update failed.")
-            
             product_stub.status = 'completed'; product_stub.seo_written = True; product_stub.processed_at = datetime.utcnow()
             db.add(SEOContent(item_id=product_stub.shopify_id, item_type='product', item_title=sanitized_title, seo_title=content.get("meta_title", sanitized_title), ai_description=content.get("description"), meta_description=content.get("meta_description")))
             processor_logger.info(f"✅ Completed: {sanitized_title}")
@@ -210,6 +181,30 @@ def root(): return {"status": "ok"}
 @app.get("/api/health")
 def health(): return {"ok": True, "service": "backend", "time": datetime.utcnow().isoformat()}
 
+# --- NEW: OpenAI Test Endpoint ---
+class TestPrompt(BaseModel):
+    prompt: str = "say hello world"
+@app.post("/api/test-openai")
+async def test_openai_connection(prompt_data: TestPrompt):
+    api_logger.info("🧪 Testing OpenAI connection...")
+    ai_service = SmartAIService(app_state["http_client"])
+    if not ai_service.client:
+        raise HTTPException(status_code=500, detail="OpenAI client not configured. Check OPENAI_API_KEY.")
+    try:
+        resp = await asyncio.to_thread(
+            ai_service.client.chat.completions.create,
+            model=ai_service.model,
+            messages=[{"role": "user", "content": prompt_data.prompt}]
+        )
+        response_text = resp.choices[0].message.content
+        api_logger.info(f"✅ OpenAI test successful. Response: {response_text}")
+        return {"status": "success", "response": response_text}
+    except Exception as e:
+        api_logger.error(f"❌ OpenAI test failed: {e}")
+        # Return a more detailed error message
+        raise HTTPException(status_code=500, detail=f"OpenAI API error: {str(e)}")
+
+
 @app.post("/api/scan")
 async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     state = db.query(SystemState).first() or init_system_state(db)
@@ -221,7 +216,6 @@ async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_
         if p.get('id') and str(p.get('id')) not in existing_pids:
             db.add(Product(shopify_id=str(p.get('id')), title=p.get('title', 'Untitled'), status='pending')); new_products += 1
     db.commit()
-    # Simplified scan for collections for brevity
     return {"products_found": new_products, "message": "Scan complete."}
 
 @app.post("/api/process-queue")
