@@ -4,7 +4,7 @@ import asyncio
 import re
 from datetime import datetime
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text
@@ -121,7 +121,7 @@ class SmartAIService:
 
 # --- App Context & Lifespan ---
 app_state = {}
-app = FastAPI(title="AI SEO Content Agent", version="STABLE-FINAL-V5")
+app = FastAPI(title="AI SEO Content Agent", version="STABLE-FINAL-V5-FIXED")
 
 @app.on_event("startup")
 async def startup_event():
@@ -181,27 +181,25 @@ def root(): return {"status": "ok"}
 @app.get("/api/health")
 def health(): return {"ok": True, "service": "backend", "time": datetime.utcnow().isoformat()}
 
-# --- NEW: OpenAI Test Endpoint ---
-class TestPrompt(BaseModel):
-    prompt: str = "say hello world"
 @app.post("/api/test-openai")
-async def test_openai_connection(prompt_data: TestPrompt):
+async def test_openai_connection():
     api_logger.info("🧪 Testing OpenAI connection...")
+    # --- THIS IS THE FIX ---
+    # Use the globally available http_client from app_state
     ai_service = SmartAIService(app_state["http_client"])
     if not ai_service.client:
         raise HTTPException(status_code=500, detail="OpenAI client not configured. Check OPENAI_API_KEY.")
     try:
-        resp = await asyncio.to_thread(
-            ai_service.client.chat.completions.create,
-            model=ai_service.model,
-            messages=[{"role": "user", "content": prompt_data.prompt}]
-        )
-        response_text = resp.choices[0].message.content
+        # Use a simple, reliable method to test the connection
+        prompt = "say hello world"
+        payload = {"model": ai_service.model, "messages": [{"role":"user","content":prompt}], "max_tokens": 10}
+        resp = await ai_service.client.post("https://api.openai.com/v1/chat/completions", headers=ai_service.openai_headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        response_text = resp.json()["choices"][0]["message"]["content"]
         api_logger.info(f"✅ OpenAI test successful. Response: {response_text}")
         return {"status": "success", "response": response_text}
     except Exception as e:
         api_logger.error(f"❌ OpenAI test failed: {e}")
-        # Return a more detailed error message
         raise HTTPException(status_code=500, detail=f"OpenAI API error: {str(e)}")
 
 
