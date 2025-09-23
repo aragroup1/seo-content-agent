@@ -4,7 +4,7 @@ import asyncio
 import re
 from datetime import datetime
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text
@@ -99,13 +99,14 @@ class ShopifyService:
 class SmartAIService:
     def __init__(self, client: httpx.AsyncClient):
         self.client = client; self.api_key = os.getenv("OPENAI_API_KEY"); self.openai_configured = bool(self.api_key); self.model = "gpt-3.5-turbo"
-        if self.openai_configured: self.openai_headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        # --- THIS IS THE FIX ---
+        if self.openai_configured: self.headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
     async def generate_full_content(self, title: str, existing_description: str) -> dict:
         if not self.openai_configured: return {}
         prompt = f'Act as an expert SEO copy editor for the product "{title}". Use the existing description for context, but create a better, more complete version. Generate: 1. A new `title` (max 60 characters). 2. A new `description` in HTML (1-2 paragraphs, 100-150 words). Format the response as a valid JSON object with "title" and "description" keys. Existing Description: "{existing_description}"'
         payload = {"model": self.model, "messages": [{"role":"system","content":"You are a concise and professional SEO copywriter who improves existing text. Ensure your response is valid JSON."},{"role":"user","content":prompt}], "temperature":0.7, "max_tokens":400, "response_format":{"type":"json_object"}}
         try:
-            resp = await self.client.post("https://api.openai.com/v1/chat/completions", headers=self.openai_headers, json=payload, timeout=60)
+            resp = await self.client.post("https://api.openai.com/v1/chat/completions", headers=self.headers, json=payload, timeout=60)
             resp.raise_for_status()
             return json.loads(resp.json()["choices"][0]["message"]["content"])
         except Exception as e: openai_logger.error(f"AI full content error for '{title}': {e}"); return {}
@@ -114,14 +115,14 @@ class SmartAIService:
         prompt = f'Based on the product title "{title}" and this existing description: "{existing_description[:1000]}...", create: 1. A new main `title` for the product page (descriptive, 60-70 characters). 2. A new SEO `meta_title` for search engines (60-70 characters). 3. A compelling `meta_description` (max 155 chars). Format the response as a valid JSON object with "title", "meta_title", and "meta_description" keys.'
         payload = {"model": self.model, "messages": [{"role":"system","content":"You are an expert SEO copywriter creating metadata. Ensure your response is valid JSON."},{"role":"user","content":prompt}], "temperature":0.7, "max_tokens":300, "response_format":{"type":"json_object"}}
         try:
-            resp = await self.client.post("https://api.openai.com/v1/chat/completions", headers=self.openai_headers, json=payload, timeout=60)
+            resp = await self.client.post("https://api.openai.com/v1/chat/completions", headers=self.headers, json=payload, timeout=60)
             resp.raise_for_status()
             return json.loads(resp.json()["choices"][0]["message"]["content"])
         except Exception as e: openai_logger.error(f"AI meta only error for '{title}': {e}"); return {}
 
 # --- App Context & Lifespan ---
 app_state = {}
-app = FastAPI(title="AI SEO Content Agent", version="STABLE-FINAL-V5-FIXED")
+app = FastAPI(title="AI SEO Content Agent", version="STABLE-FINAL-V6")
 
 @app.on_event("startup")
 async def startup_event():
@@ -184,16 +185,13 @@ def health(): return {"ok": True, "service": "backend", "time": datetime.utcnow(
 @app.post("/api/test-openai")
 async def test_openai_connection():
     api_logger.info("🧪 Testing OpenAI connection...")
-    # --- THIS IS THE FIX ---
-    # Use the globally available http_client from app_state
     ai_service = SmartAIService(app_state["http_client"])
-    if not ai_service.client:
+    if not ai_service.openai_configured:
         raise HTTPException(status_code=500, detail="OpenAI client not configured. Check OPENAI_API_KEY.")
     try:
-        # Use a simple, reliable method to test the connection
         prompt = "say hello world"
         payload = {"model": ai_service.model, "messages": [{"role":"user","content":prompt}], "max_tokens": 10}
-        resp = await ai_service.client.post("https://api.openai.com/v1/chat/completions", headers=ai_service.openai_headers, json=payload, timeout=30)
+        resp = await ai_service.client.post("https://api.openai.com/v1/chat/completions", headers=ai_service.headers, json=payload, timeout=30)
         resp.raise_for_status()
         response_text = resp.json()["choices"][0]["message"]["content"]
         api_logger.info(f"✅ OpenAI test successful. Response: {response_text}")
