@@ -1,113 +1,250 @@
-'use client';
+import os
+import json
+import asyncio
+import re
+from datetime import datetime
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text
+from sqlalchemy.orm import declarative_base, Session, sessionmaker
+from dotenv import load_dotenv
+from openai import OpenAI
+import httpx
+import logging
+import traceback
 
-import { useState, useEffect, useMemo } from 'react';
-import axios from 'axios';
-import { 
-  RefreshCw, Activity, Package, Clock, CheckCircle, PlayCircle, Search,
-  PauseCircle, AlertTriangle, TrendingUp, FileText, Plus, Layers, Sparkles,
-  Zap, Target, Edit3, Trash2, TestTube2
-} from 'lucide-react';
+# --- Setup ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("main"); shopify_logger = logging.getLogger("shopify"); openai_logger = logging.getLogger("openai"); db_logger = logging.getLogger("database"); api_logger = logging.getLogger("api"); processor_logger = logging.getLogger("processor")
+load_dotenv()
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+# --- Database ---
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"): DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+else: DATABASE_URL = "sqlite:///./seo_agent.db"
+engine = create_engine(DATABASE_URL); SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine); Base = declarative_base()
 
-export default function Dashboard() {
-  const [dashboard, setDashboard] = useState<any>(null);
-  const [processing, setProcessing] = useState(false);
-  const [errMsg, setErrMsg] = useState<string | null>(null);
+# --- Models ---
+class Product(Base): __tablename__ = "products"; id=Column(Integer,primary_key=True); shopify_id=Column(String,unique=True,index=True); title=Column(String); handle=Column(String,nullable=True); status=Column(String,default="pending"); seo_written=Column(Boolean,default=False); created_at=Column(DateTime,default=datetime.utcnow); updated_at=Column(DateTime,default=datetime.utcnow,onupdate=datetime.utcnow); processed_at=Column(DateTime,nullable=True)
+class Collection(Base): __tablename__ = "collections"; id=Column(Integer,primary_key=True); shopify_id=Column(String,unique=True,index=True); title=Column(String); handle=Column(String,nullable=True); products_count=Column(Integer,default=0); status=Column(String,default="pending"); seo_written=Column(Boolean,default=False); created_at=Column(DateTime,default=datetime.utcnow); updated_at=Column(DateTime,default=datetime.utcnow,onupdate=datetime.utcnow); processed_at=Column(DateTime,nullable=True)
+class SEOContent(Base): __tablename__ = "seo_content"; id=Column(Integer,primary_key=True); item_id=Column(String,index=True); item_type=Column(String); item_title=Column(String); seo_title=Column(String); meta_description=Column(String,nullable=True); ai_description=Column(Text,nullable=True); generated_at=Column(DateTime,default=datetime.utcnow)
+class SystemState(Base): __tablename__ = "system_state"; id=Column(Integer,primary_key=True); is_paused=Column(Boolean,default=False); auto_pause_triggered=Column(Boolean,default=False); last_scan=Column(DateTime,nullable=True); products_found_in_last_scan=Column(Integer,default=0); collections_found_in_last_scan=Column(Integer,default=0); total_items_processed=Column(Integer,default=0)
+try: Base.metadata.create_all(bind=engine); db_logger.info("✅ DB tables verified")
+except Exception as e: db_logger.error(f"❌ DB error: {e}")
 
-  const api = useMemo(() => axios.create({ baseURL: API_URL, timeout: 60000 }), [API_URL]);
+# --- Helpers ---
+def get_db():
+    db = SessionLocal();
+    try: yield db
+    finally: db.close()
+def init_system_state(db: Session):
+    state = db.query(SystemState).first()
+    if not state: state=SystemState(is_paused=False); db.add(state); db.commit()
+    return state
+def clean_input_text(text: str) -> str:
+    if not text: return ""
+    cleaned = re.sub(r'^KATEX_INLINE_OPEN.*KATEX_INLINE_CLOSE\s*', '', text)
+    shipping_phrases = ["Large Letter Rate", "Big Parcel Rate", "Small Parcel Rate", "Parcel Rate"]
+    pattern = r'\s*KATEX_INLINE_OPEN(?:' + '|'.join(shipping_phrases) + r')KATEX_INLINE_CLOSE\s*|\s*(?:' + '|'.join(shipping_phrases) + r')\s*'
+    cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+def sanitize_output_title(title: str) -> str:
+    return re.sub(r'\s+', ' ', re.sub(r'[^a-zA-Z0-9\s]', '', title)).strip()
+def html_to_text(html_content: str) -> str:
+    if not html_content: return ""
+    return re.sub('<[^<]+?>', ' ', html_content).strip()
 
-  async function safe<T>(fn: () => Promise<T>) {
-    try {
-      setErrMsg(null);
-      return await fn();
-    } catch (e: any) {
-      console.error('API error:', e?.response?.status, e?.response?.data || e?.message);
-      const status = e?.response?.status;
-      const data = e?.response?.data;
-      const message = typeof data === 'string' ? data : (data?.detail || JSON.stringify(data));
-      setErrMsg(`Request failed (${status || 'network'}): ${message}`);
-      throw e;
+# --- Services ---
+class ShopifyService:
+    def __init__(self, client: httpx.AsyncClient):
+        self.client = client; self.shop_domain = os.getenv("SHOPIFY_SHOP_DOMAIN"); self.access_token = os.getenv("SHOPIFY_ACCESS_TOKEN"); self.api_version = "2024-01"; self.configured = bool(self.shop_domain and self.access_token)
+        if self.configured: self.base_url = f"https://{self.shop_domain}/admin/api/{self.api_version}"; self.headers = {"X-Shopify-Access-Token": self.access_token, "Content-Type": "application/json"}
+    async def get_all_paginated_resources(self, endpoint: str, resource_key: str, fields: str):
+        if not self.configured: return []
+        resources, page_info, page_count = [], None, 1
+        url = f"{self.base_url}/{endpoint}.json?limit=250&fields={fields}"
+        while url:
+            try:
+                resp = await self.client.get(url, headers=self.headers, timeout=45)
+                resp.raise_for_status(); data = resp.json().get(resource_key, [])
+                resources.extend(data); shopify_logger.info(f"Fetched page {page_count} ({len(data)} items) from {endpoint}.")
+                link_header = resp.headers.get("Link"); match = re.search(r'<[^>]*[?&]page_info=([^&>]+)[^>]*>;\s*rel="next"', link_header or "")
+                page_info = match.group(1) if match else None
+                if page_info: url = f"{self.base_url}/{endpoint}.json?limit=250&fields={fields}&page_info={page_info}"; page_count += 1
+                else: url = None
+            except Exception as e: shopify_logger.error(f"Failed to fetch page {page_count} from {endpoint}: {e}"); break
+        return resources
+    async def get_all_products(self): return await self.get_all_paginated_resources("products", "products", "id,title")
+    async def get_all_collections(self):
+        smart = await self.get_all_paginated_resources("smart_collections", "smart_collections", "id,title,products_count")
+        custom = await self.get_all_paginated_resources("custom_collections", "custom_collections", "id,title,products_count")
+        return smart + custom
+    async def get_product_details(self, product_id: str):
+        if not self.configured: return None
+        try: resp = await self.client.get(f"{self.base_url}/products/{product_id}.json", headers=self.headers, params={"fields":"id,title,body_html"}, timeout=20); resp.raise_for_status(); return resp.json().get("product")
+        except Exception as e: shopify_logger.error(f"Failed to get details for product {product_id}: {e}"); return None
+    async def update_product(self, product_id: str, title: Optional[str]=None, description: Optional[str]=None, meta_title: Optional[str]=None, meta_description: Optional[str]=None):
+        if not self.configured: return False
+        payload={"product":{"id":int(product_id)}}; metafields=[]
+        if title: payload["product"]["title"]=title
+        if description: payload["product"]["body_html"]=description
+        if meta_title: metafields.append({"key":"title_tag","namespace":"global","value":meta_title,"type":"string"})
+        if meta_description: metafields.append({"key":"description_tag","namespace":"global","value":meta_description,"type":"string"})
+        if metafields: payload["product"]["metafields"]=metafields
+        try: resp = await self.client.put(f"{self.base_url}/products/{product_id}.json", headers=self.headers, json=payload, timeout=30); resp.raise_for_status(); return True
+        except Exception as e: shopify_logger.error(f"Shopify update failed for product {product_id}: {e}"); return False
+
+class SmartAIService:
+    def __init__(self, client: httpx.AsyncClient):
+        self.client = client; self.api_key = os.getenv("OPENAI_API_KEY"); self.openai_configured = bool(self.api_key); self.model = "gpt-3.5-turbo"
+        if self.openai_configured: self.openai_headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+    async def generate_full_content(self, title: str, existing_description: str) -> dict:
+        if not self.openai_configured: return {}
+        prompt = f'Act as an expert SEO copy editor for the product "{title}". Use the existing description for context, but create a better, more complete version. Generate: 1. A new `title` (max 60 characters). 2. A new `description` in HTML (1-2 paragraphs, 100-150 words). Format the response as a valid JSON object with "title" and "description" keys. Existing Description: "{existing_description}"'
+        payload = {"model": self.model, "messages": [{"role":"system","content":"You are a concise and professional SEO copywriter who improves existing text. Ensure your response is valid JSON."},{"role":"user","content":prompt}], "temperature":0.7, "max_tokens":400, "response_format":{"type":"json_object"}}
+        try:
+            resp = await self.client.post("https://api.openai.com/v1/chat/completions", headers=self.openai_headers, json=payload, timeout=60)
+            resp.raise_for_status()
+            return json.loads(resp.json()["choices"][0]["message"]["content"])
+        except Exception as e: openai_logger.error(f"AI full content error for '{title}': {e}"); return {}
+    async def generate_meta_only_content(self, title: str, existing_description: str) -> dict:
+        if not self.openai_configured: return {}
+        prompt = f'Based on the product title "{title}" and this existing description: "{existing_description[:1000]}...", create: 1. A new main `title` for the product page (descriptive, 60-70 characters). 2. A new SEO `meta_title` for search engines (60-70 characters). 3. A compelling `meta_description` (max 155 chars). Format the response as a valid JSON object with "title", "meta_title", and "meta_description" keys.'
+        payload = {"model": self.model, "messages": [{"role":"system","content":"You are an expert SEO copywriter creating metadata. Ensure your response is valid JSON."},{"role":"user","content":prompt}], "temperature":0.7, "max_tokens":300, "response_format":{"type":"json_object"}}
+        try:
+            resp = await self.client.post("https://api.openai.com/v1/chat/completions", headers=self.openai_headers, json=payload, timeout=60)
+            resp.raise_for_status()
+            return json.loads(resp.json()["choices"][0]["message"]["content"])
+        except Exception as e: openai_logger.error(f"AI meta only error for '{title}': {e}"); return {}
+
+# --- App Context & Lifespan ---
+app_state = {}
+app = FastAPI(title="AI SEO Content Agent", version="STABLE-FINAL-V5-FIXED")
+
+@app.on_event("startup")
+async def startup_event():
+    app_state["http_client"] = httpx.AsyncClient()
+    logger.info("HTTP client started.")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await app_state["http_client"].aclose()
+    logger.info("HTTP client closed.")
+
+# --- Background Processing ---
+async def process_pending_items(db: Session, http_client: httpx.AsyncClient):
+    shopify = ShopifyService(http_client); ai_service = SmartAIService(http_client)
+    processor_logger.info("="*60 + "\n🚀 STARTING SMART CONTENT OPTIMIZATION RUN\n" + "="*60)
+    WORD_COUNT_THRESHOLD = int(os.getenv("DESCRIPTION_WORD_COUNT_THRESHOLD", 100))
+    pending_products = db.query(Product).filter(Product.status.in_(['pending', 'failed'])).limit(5).all()
+    processor_logger.info(f"Found {len(pending_products)} pending products to process.")
+    for product_stub in pending_products:
+        original_title = product_stub.title
+        try:
+            product_stub.status = 'processing'; db.commit()
+            full_product = await shopify.get_product_details(product_stub.shopify_id)
+            if not full_product: raise Exception("Could not fetch full product details")
+            existing_desc = full_product.get('body_html', '')
+            cleaned_title = clean_input_text(original_title); cleaned_desc_text = clean_input_text(html_to_text(existing_desc))
+            word_count = len(cleaned_desc_text.split())
+            processor_logger.info(f"⚙️ Processing: '{original_title}' -> '{cleaned_title}' (desc words: {word_count})")
+            content = {}
+            sanitized_title = ""
+            if word_count >= WORD_COUNT_THRESHOLD:
+                processor_logger.info(f"🎯 Meta Only Mode")
+                content = await ai_service.generate_meta_only_content(cleaned_title, cleaned_desc_text)
+                if not content or "title" not in content: raise Exception("Meta-only AI output invalid")
+                sanitized_title = sanitize_output_title(content["title"])
+                success = await shopify.update_product(product_stub.shopify_id, title=sanitized_title, meta_title=content.get("meta_title"), meta_description=content.get("meta_description"))
+            else:
+                processor_logger.info(f"✍️ Full Rewrite Mode")
+                content = await ai_service.generate_full_content(cleaned_title, cleaned_desc_text)
+                if not content or "title" not in content or "description" not in content: raise Exception("Full-rewrite AI output invalid")
+                sanitized_title = sanitize_output_title(content["title"])
+                success = await shopify.update_product(product_stub.shopify_id, title=sanitized_title, description=content.get("description"))
+            if not success: raise Exception("Shopify API update failed.")
+            product_stub.status = 'completed'; product_stub.seo_written = True; product_stub.processed_at = datetime.utcnow()
+            db.add(SEOContent(item_id=product_stub.shopify_id, item_type='product', item_title=sanitized_title, seo_title=content.get("meta_title", sanitized_title), ai_description=content.get("description"), meta_description=content.get("meta_description")))
+            processor_logger.info(f"✅ Completed: {sanitized_title}")
+        except Exception as e:
+            product_stub.status = 'failed'; processor_logger.error(f"❌ Failed: {original_title} -> {e}"); traceback.print_exc()
+        finally: db.commit(); await asyncio.sleep(2)
+    processor_logger.info("🏁 Background processing run finished.")
+
+# --- API Endpoints ---
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+@app.get("/")
+def root(): return {"status": "ok"}
+@app.get("/api/health")
+def health(): return {"ok": True, "service": "backend", "time": datetime.utcnow().isoformat()}
+
+@app.post("/api/test-openai")
+async def test_openai_connection():
+    api_logger.info("🧪 Testing OpenAI connection...")
+    # --- THIS IS THE FIX ---
+    # Use the globally available http_client from app_state
+    ai_service = SmartAIService(app_state["http_client"])
+    if not ai_service.client:
+        raise HTTPException(status_code=500, detail="OpenAI client not configured. Check OPENAI_API_KEY.")
+    try:
+        # Use a simple, reliable method to test the connection
+        prompt = "say hello world"
+        payload = {"model": ai_service.model, "messages": [{"role":"user","content":prompt}], "max_tokens": 10}
+        resp = await ai_service.client.post("https://api.openai.com/v1/chat/completions", headers=ai_service.openai_headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        response_text = resp.json()["choices"][0]["message"]["content"]
+        api_logger.info(f"✅ OpenAI test successful. Response: {response_text}")
+        return {"status": "success", "response": response_text}
+    except Exception as e:
+        api_logger.error(f"❌ OpenAI test failed: {e}")
+        raise HTTPException(status_code=500, detail=f"OpenAI API error: {str(e)}")
+
+
+@app.post("/api/scan")
+async def scan_all(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    state = db.query(SystemState).first() or init_system_state(db)
+    if state.is_paused: return {"error": "System is paused"}
+    shopify = ShopifyService(app_state["http_client"])
+    products = await shopify.get_all_products(); new_products = 0
+    existing_pids = {r[0] for r in db.query(Product.shopify_id).all()}
+    for p in products:
+        if p.get('id') and str(p.get('id')) not in existing_pids:
+            db.add(Product(shopify_id=str(p.get('id')), title=p.get('title', 'Untitled'), status='pending')); new_products += 1
+    db.commit()
+    return {"products_found": new_products, "message": "Scan complete."}
+
+@app.post("/api/process-queue")
+async def trigger_processing(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    state = db.query(SystemState).first()
+    if state and state.is_paused: return {"error":"System is paused"}
+    background_tasks.add_task(process_pending_items, db, app_state["http_client"])
+    return {"message": "Processing task started."}
+
+@app.get("/api/dashboard")
+async def get_dashboard(db: Session = Depends(get_db)):
+    state = db.query(SystemState).first() or init_system_state(db)
+    total_products = db.query(Product).count()
+    completed = db.query(Product).filter(Product.status == "completed").count()
+    pending = db.query(Product).filter(Product.status.in_(["pending", "failed"])).count()
+    recent = db.query(Product).order_by(Product.updated_at.desc()).limit(5).all()
+    return {
+        "system": {"is_paused": state.is_paused, "last_scan": state.last_scan.isoformat() if state.last_scan else None},
+        "stats": {"products": {"total": total_products, "completed": completed, "pending": pending}},
+        "recent_activity": [{'id': p.shopify_id, 'title': p.title, 'status': p.status, 'updated': p.updated_at.isoformat()} for p in recent]
     }
-  }
 
-  const fetchDashboard = async () => {
-    try { const res = await safe(() => api.get('/api/dashboard')); if (res && res.data) setDashboard(res.data); } catch (e) {}
-  };
+@app.post("/api/pause")
+async def toggle_pause(db: Session = Depends(get_db)):
+    state = db.query(SystemState).first() or init_system_state(db)
+    state.is_paused = not state.is_paused; db.commit()
+    return {"is_paused": state.is_paused}
 
-  useEffect(() => {
-    fetchDashboard();
-    const id = setInterval(fetchDashboard, 10000);
-    return () => clearInterval(id);
-  }, []);
+@app.get("/api/logs")
+async def get_logs(db: Session = Depends(get_db)):
+    logs = db.query(SEOContent).order_by(SEOContent.generated_at.desc()).limit(50).all()
+    return {"logs": [{'item_id': log.item_id, 'item_type': log.item_type, 'item_title': log.item_title, 'generated_at': log.generated_at.isoformat()} for log in logs]}
 
-  const handleApiAction = async (fn: () => Promise<any>) => {
-    if (processing) return;
-    setProcessing(true);
-    try {
-      await safe(fn);
-      setTimeout(() => {
-        fetchDashboard();
-        setProcessing(false);
-      }, 2000);
-    } catch {
-      setProcessing(false);
-    }
-  };
-
-  const scanAll = () => handleApiAction(() => api.post('/api/scan'));
-  const processQueue = () => handleApiAction(() => api.post('/api/process-queue'));
-  const togglePause = () => handleApiAction(() => api.post('/api/pause'));
-  
-  const testOpenAI = async () => {
-    setProcessing(true);
-    try {
-        const res = await safe(() => api.post('/api/test-openai', { prompt: 'say hello world' }));
-        alert(`✅ OpenAI Test SUCCESS!\n\nResponse: "${res.data.response}"`);
-    } catch (e: any) {
-        // Error is already handled by safe() and displayed in errMsg
-        alert(`❌ OpenAI Test FAILED. Check the error message on the dashboard.`);
-    } finally {
-        setProcessing(false);
-    }
-  };
-
-  if (!dashboard) {
-    return (<div className="min-h-screen bg-gray-50 flex items-center justify-center"><div className="text-center"><Activity className="w-12 h-12 text-gray-400 animate-pulse mx-auto mb-4" /><p className="text-gray-500">Connecting to AI Agent...</p><p className="text-xs text-gray-400 mt-2">API: {API_URL}</p></div></div>);
-  }
-
-  return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-50 via-purple-50 to-pink-50">
-      <header className="sticky top-0 z-50 backdrop-blur-xl bg-white/80 border-b border-white/20">
-        <div className="max-w-7xl mx-auto px-6 py-4"><div className="flex justify-between items-center"><div className="flex items-center space-x-3"><div className="p-2 bg-gradient-to-br from-purple-500 to-pink-500 rounded-xl"><Sparkles className="w-6 h-6 text-white" /></div><div><h1 className="text-2xl font-bold bg-gradient-to-r from-purple-600 to-pink-600 bg-clip-text text-transparent">AI SEO Content Agent</h1><p className="text-xs text-gray-600">API: {API_URL}</p></div></div><div className={`px-6 py-3 rounded-2xl font-medium transition-all ${dashboard.system.is_paused ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'} shadow-lg`}><div className="flex items-center space-x-2">{dashboard.system.is_paused ? (<><div className="w-2 h-2 bg-red-500 rounded-full"></div><span>PAUSED</span></>) : (<><div className="w-2 h-2 bg-green-500 rounded-full relative before:absolute before:-inset-1 before:bg-current before:rounded-full before:opacity-75 before:animate-ping"></div><span>ACTIVE</span></>)}</div></div></div></div>
-      </header>
-      
-      <main className="max-w-7xl mx-auto px-6 py-8 space-y-6">
-        {errMsg && <div className="p-3 rounded-md bg-red-50 border border-red-200 text-red-700 text-sm break-all">{errMsg}</div>}
-        
-        <div className="flex flex-wrap gap-3">
-          <ActionButton onClick={scanAll} disabled={processing || dashboard.system.is_paused} icon={<Search className="w-4 h-4" />} label="Scan All" gradient="from-blue-500 to-cyan-500" />
-          <ActionButton onClick={processQueue} disabled={processing || dashboard.system.is_paused} icon={<Zap className="w-4 h-4" />} label="Process Queue" gradient="from-green-500 to-emerald-500" />
-          <ActionButton onClick={togglePause} disabled={processing} icon={dashboard.system.is_paused ? <PlayCircle className="w-4 h-4" /> : <PauseCircle className="w-4 h-4" />} label={dashboard.system.is_paused ? "Resume" : "Pause"} gradient={dashboard.system.is_paused ? "from-green-500 to-emerald-500" : "from-red-500 to-pink-500"} />
-          <ActionButton onClick={testOpenAI} disabled={processing} icon={<TestTube2 className="w-4 h-4" />} label="Test OpenAI" gradient="from-orange-500 to-yellow-500" />
-        </div>
-        
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-          <StatCard title="Products" stats={dashboard.stats.products} icon={<Package className="w-5 h-5" />} gradient="from-blue-500 to-cyan-500" />
-          <StatCard title="Collections" stats={dashboard.stats.collections} icon={<Layers className="w-5 h--5" />} gradient="from-purple-500 to-pink-500" />
-          <StatCard title="Total Completed" value={dashboard.stats.total_completed} icon={<CheckCircle className="w-5 h-5" />} gradient="from-orange-500 to-red-500" />
-          <StatCard title="Last Scan" value={dashboard.system.last_scan ? new Date(dashboard.system.last_scan).toLocaleString() : 'Never'} icon={<Clock className="w-5 h-5" />} gradient="from-green-500 to-emerald-500" />
-        </div>
-        
-        {/* ... other components ... */}
-      </main>
-    </div>
-  );
-}
-
-// --- Self-Contained Components ---
-interface StatCardProps { title: string; stats?: { total: number; completed: number; pending: number; }; value?: string | number; icon: React.ReactNode; gradient: string; }
-const StatCard: React.FC<StatCardProps> = ({ title, stats, value, icon, gradient }) => { const total = stats?.total ?? value ?? 0; const completed = stats?.completed ?? 0; const pending = stats?.pending ?? 0; return (<div className="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl p-6 transition-all duration-300 hover:-translate-y-1 hover:shadow-2xl"><div className="flex items-center justify-between mb-4"><h3 className="text-sm font-medium text-gray-600">{title}</h3><div className={`p-2 bg-gradient-to-br ${gradient} rounded-lg text-white`}>{icon}</div></div>{stats ? (<div><p className="text-3xl font-bold text-gray-900">{total}</p><div className="flex space-x-4 mt-2 text-xs"><span className="text-green-600">✓ {completed}</span><span className="text-yellow-600">⏳ {pending}</span></div></div>) : (<p className="text-3xl font-bold text-gray-900">{total}</p>)}</div>); };
-interface ActionButtonProps { onClick: () => void; disabled?: boolean; icon: React.ReactNode; label: string; gradient: string; }
-const ActionButton: React.FC<ActionButtonProps> = ({ onClick, disabled = false, icon, label, gradient }) => (<button onClick={onClick} disabled={disabled} className={`px-6 py-3 bg-gradient-to-r ${gradient} text-white rounded-xl font-medium shadow-lg hover:shadow-xl transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center space-x-2`}>{icon}<span>{label}</span></button>);
-// ... (rest of the components)
+# ... (You can add your manual-queue endpoints back here if you need them)
